@@ -355,7 +355,9 @@ jobs:
               if keep:
                   dst = package / rel
                   dst.parent.mkdir(parents=True, exist_ok=True)
-                  if src.is_symlink():
+                  # Materialize the selected DRI shim; its upstream symlink
+                  # points to a shared shim used by many unselected drivers.
+                  if src.is_symlink() and rel.parent != Path('lib/dri'):
                       assert not Path(os.readlink(src)).is_absolute(), src
                       dst.symlink_to(os.readlink(src))
                   else:
