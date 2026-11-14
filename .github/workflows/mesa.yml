@@ -178,6 +178,22 @@ jobs:
           export STAGE_DIR="$work/stage" PREFIX="$work/prefix"
           export PACKAGE_DIR="$work/package"
           mkdir -p "$PACKAGE_DIR"
+          # LLVM may inline this AArch64 asm more than once during full LTO.
+          # Numbered local labels can repeat; the upstream named label cannot.
+          # Patch only the known pair, and tolerate an upstream fix later.
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          source = Path(os.environ['SOURCE_DIR']) / 'src/util/streaming-load-memcpy.c'
+          text = source.read_text()
+          label, branch = '"loop64:\\n"', '"  b.pl loop64\\n"'
+          if label in text or branch in text:
+              assert text.count(label) == text.count(branch) == 1
+              source.write_text(text.replace(label, '"1:\\n"').replace(branch, '"  b.pl 1b\\n"'))
+              print('Fixed AArch64 streaming memcpy asm labels for LTO')
+          else:
+              print('Upstream streaming memcpy does not need the known label fix')
+          PY
           # New Mesa releases need protocol XML newer than Debian stable. Use
           # Mesa's own checksum-pinned source, with no new runtime libraries.
           python3 - <<'PY'
@@ -275,6 +291,47 @@ jobs:
           print('Audited compilation flags:', checked)
           PY
           meson compile -C "$BUILD_DIR" --jobs "$(nproc)"
+          # Exercise the actual optimized Mesa object, including co-aligned,
+          # misaligned, zero-length, head/tail and multiple-cache-line copies.
+          cat > "$work/streaming-probe.c" <<'C'
+          #include <stddef.h>
+          #include <string.h>
+          void util_streaming_load_memcpy(void *restrict, void *restrict, size_t);
+          int main(void) {
+            _Alignas(16) unsigned char source[2048], target[2048], expected[2048];
+            const size_t lengths[] = {0, 1, 15, 16, 17, 63, 64, 65, 127, 128, 129, 255, 256, 257, 1023};
+            for (size_t i = 0; i < sizeof(source); ++i) source[i] = (unsigned char)(i * 37);
+            util_streaming_load_memcpy(target, source, 64);
+            util_streaming_load_memcpy(target + 64, source + 64, 128);
+            util_streaming_load_memcpy(target + 192, source + 192, 256);
+            if (memcmp(target, source, 448)) return 1;
+            for (size_t s = 0; s < 32; ++s)
+              for (size_t d = 0; d < 32; ++d)
+                for (size_t n = 0; n < sizeof(lengths) / sizeof(lengths[0]); ++n) {
+                  memset(target, 0xa5, sizeof(target));
+                  memset(expected, 0xa5, sizeof(expected));
+                  memcpy(expected + d, source + s, lengths[n]);
+                  util_streaming_load_memcpy(target + d, source + s, lengths[n]);
+                  if (memcmp(target, expected, sizeof(target))) return 2;
+                }
+            return 0;
+          }
+          C
+          python3 - <<'PY'
+          import json, os, shlex, subprocess
+          from pathlib import Path
+          build = Path(os.environ['BUILD_DIR'])
+          command, = [item for item in json.loads((build / 'compile_commands.json').read_text())
+                      if Path(item['file']).name == 'streaming-load-memcpy.c']
+          args = command.get('arguments') or shlex.split(command['command'])
+          obj = Path(command['directory']) / args[args.index('-o') + 1]
+          probe = build.parent / 'streaming-probe'
+          subprocess.run([os.environ['CC'], *shlex.split(os.environ['CFLAGS']),
+                          str(probe.with_suffix('.c')), str(obj), *shlex.split(os.environ['LDFLAGS']),
+                          '-o', str(probe)], check=True)
+          subprocess.run([probe], check=True)
+          print('Mesa streaming memcpy regression check passed with full LTO')
+          PY
           DESTDIR="$STAGE_DIR" meson install -C "$BUILD_DIR" --no-rebuild
 
           # Mesa 25+ EGL/GLX/GBM require the matching libgallium. Retain those
