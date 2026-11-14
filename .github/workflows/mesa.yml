@@ -346,7 +346,7 @@ jobs:
               if not src.is_file():
                   continue
               rel = src.relative_to(installed)
-              keep = (rel.parent == Path('lib') and libraries.fullmatch(src.name))
+              keep = (rel.parent == Path('lib') and bool(libraries.fullmatch(src.name)))
               keep |= (rel.parent == Path('lib/dri') and src.name == 'v3d_dri.so')
               keep |= (rel.as_posix() == 'lib/gbm/dri_gbm.so')
               keep |= (rel.parent == Path('share/drirc.d') and src.suffix == '.conf')
