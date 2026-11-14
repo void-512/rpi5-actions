@@ -1,4 +1,4 @@
-name: Vulkan SDK - Raspberry Pi 5 - Debian 13
+name: Vulkan SDK - Debian 13
 
 on:
   workflow_dispatch:
