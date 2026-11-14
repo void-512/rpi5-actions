@@ -288,6 +288,7 @@ jobs:
               rel = src.relative_to(installed)
               keep = (rel.parent == Path('lib') and libraries.fullmatch(src.name))
               keep |= (rel.parent == Path('lib/dri') and src.name == 'v3d_dri.so')
+              keep |= (rel.as_posix() == 'lib/gbm/dri_gbm.so')
               keep |= (rel.parent == Path('share/drirc.d') and src.suffix == '.conf')
               keep |= (rel.parent == Path('share/vulkan/icd.d') and src.name.startswith('broadcom_icd') and src.suffix == '.json')
               keep |= (rel.parent == Path('share/glvnd/egl_vendor.d') and src.name == '50_mesa.json')
@@ -308,7 +309,7 @@ jobs:
           data = json.loads(vendor.read_text())
           data['ICD']['library_path'] = 'libEGL_mesa.so.0'
           vendor.write_text(json.dumps(data, indent=2) + '\n')
-          for pattern in ('lib/dri/v3d_dri.so', 'lib/libgallium-*.so', 'lib/libEGL_mesa.so.0', 'lib/libGLX_mesa.so.0', 'lib/libgbm.so.1', 'lib/libvulkan_broadcom.so'):
+          for pattern in ('lib/dri/v3d_dri.so', 'lib/gbm/dri_gbm.so', 'lib/libgallium-*.so', 'lib/libEGL_mesa.so.0', 'lib/libGLX_mesa.so.0', 'lib/libgbm.so.1', 'lib/libvulkan_broadcom.so'):
               assert list(package.glob(pattern)), pattern
           shutil.copy2(Path(os.environ['SOURCE_DIR']) / 'docs/license.rst', package / 'LICENSE')
           PY
@@ -352,6 +353,7 @@ jobs:
             mesa_root="$(pwd -P)"  # Run from the extracted directory.
             export LD_LIBRARY_PATH="$mesa_root/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
             export LIBGL_DRIVERS_PATH="$mesa_root/lib/dri"
+            export GBM_BACKENDS_PATH="$mesa_root/lib/gbm"
             export __GLX_VENDOR_LIBRARY_NAME=mesa
             export __EGL_VENDOR_LIBRARY_FILENAMES="$mesa_root/share/glvnd/egl_vendor.d/50_mesa.json"
             export DRIRC_CONFIGDIR="$mesa_root/share/drirc.d"
@@ -398,6 +400,7 @@ jobs:
           tar -xzf "$archive" -C "$CHECK_ROOT"
           rm -rf "$BUILD_ROOT/package"
           export LD_LIBRARY_PATH="$CHECK_ROOT/lib"
+          export GBM_BACKENDS_PATH="$CHECK_ROOT/lib/gbm"
           export __EGL_VENDOR_LIBRARY_FILENAMES="$CHECK_ROOT/share/glvnd/egl_vendor.d/50_mesa.json"
           export VK_DRIVER_FILES="$(find "$CHECK_ROOT/share/vulkan/icd.d" -name 'broadcom_icd*.json' -print -quit)"
           export VK_ICD_FILENAMES="$VK_DRIVER_FILES"
@@ -422,6 +425,7 @@ jobs:
               ok = rel.as_posix() in ('LICENSE', 'README.txt')
               ok |= rel.parent == Path('lib') and bool(allowed.fullmatch(path.name))
               ok |= rel.as_posix() == 'lib/dri/v3d_dri.so'
+              ok |= rel.as_posix() == 'lib/gbm/dri_gbm.so'
               ok |= rel.parent == Path('share/drirc.d') and path.suffix == '.conf'
               ok |= rel.parent == Path('share/vulkan/icd.d') and path.name.startswith('broadcom_icd') and path.suffix == '.json'
               ok |= rel.as_posix() == 'share/glvnd/egl_vendor.d/50_mesa.json'
@@ -453,6 +457,9 @@ jobs:
           egl.eglQueryString.argtypes = [c.c_void_p, c.c_uint]
           egl.eglQueryString.restype = c.c_char_p
           assert egl.eglQueryString(None, 0x3055)  # EGL_EXTENSIONS; no display/GPU.
+          egl.eglGetPlatformDisplay.argtypes = [c.c_uint, c.c_void_p, c.c_void_p]
+          egl.eglGetPlatformDisplay.restype = c.c_void_p
+          assert egl.eglGetPlatformDisplay(0x31DD, None, None)  # EGL_PLATFORM_SURFACELESS_MESA.
           # Exercise Debian's Vulkan loader with only our packaged ICD enabled.
           class InstanceInfo(c.Structure):
               _fields_ = [('sType', c.c_uint32), ('pNext', c.c_void_p), ('flags', c.c_uint32),
