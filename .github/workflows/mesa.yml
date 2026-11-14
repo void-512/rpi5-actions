@@ -373,12 +373,7 @@ jobs:
           vendor.write_text(json.dumps(data, indent=2) + '\n')
           for pattern in ('lib/dri/v3d_dri.so', 'lib/gbm/dri_gbm.so', 'lib/libgallium-*.so', 'lib/libEGL_mesa.so.0', 'lib/libGLX_mesa.so.0', 'lib/libgbm.so.1', 'lib/libvulkan_broadcom.so'):
               assert list(package.glob(pattern)), pattern
-          shutil.copy2(Path(os.environ['SOURCE_DIR']) / 'docs/license.rst', package / 'LICENSE')
           PY
-          while IFS= read -r license; do
-            cat "$license" >> "$PACKAGE_DIR/LICENSE"
-          done < <(dpkg-query -L libc++-23-dev libc++abi-23-dev libunwind-23-dev \
-            | awk '/\/copyright$/' | sort -u)
           # Resolve every external dependency to its owning Debian package.
           export LD_LIBRARY_PATH="$PACKAGE_DIR/lib"
           : > "$BUILD_ROOT/runtime-packages.txt"
@@ -404,30 +399,22 @@ jobs:
           # Pinning the validation environment to Debian repositories proves no
           # LLVM repository runtime or copied build dependency is needed.
           printf '%s\n' "$version" > "$BUILD_ROOT/version"
-          {
-            printf 'Mesa %s / Debian 13 arm64 / Cortex-A76\n\n' "$version"
-            printf 'CC=%s\nCXX=%s\nCFLAGS=%s\nCXXFLAGS=%s\nLDFLAGS=%s\n\n' "$CC" "$CXX" "$CFLAGS" "$CXXFLAGS" "$LDFLAGS"
-            printf 'Debian runtime packages (install with apt):\n'
-            cat "$BUILD_ROOT/runtime-packages.txt"
-            cat <<'INSTALL'
-
-          Extract the archive into an empty directory of your choice, then set:
-            mesa_root="$(pwd -P)"  # Run from the extracted directory.
-            export LD_LIBRARY_PATH="$mesa_root/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-            export LIBGL_DRIVERS_PATH="$mesa_root/lib/dri"
-            export GBM_BACKENDS_PATH="$mesa_root/lib/gbm"
-            export __GLX_VENDOR_LIBRARY_NAME=mesa
-            export __EGL_VENDOR_LIBRARY_FILENAMES="$mesa_root/share/glvnd/egl_vendor.d/50_mesa.json"
-            export DRIRC_CONFIGDIR="$mesa_root/share/drirc.d"
-            export VK_DRIVER_FILES="$(find "$mesa_root/share/vulkan/icd.d" -name 'broadcom_icd*.json' -print -quit)"
-            export VK_ICD_FILENAMES="$VK_DRIVER_FILES"
-          Run applications from that shell. No system libraries are overwritten.
-          Use Debian's libegl1/libglx0/libopengl0/libgles2/libvulkan1 dispatchers.
-          LLVM 23 runtimes are statically linked into Mesa where needed.
-          LTO uses Mesa's explicit allow-broken-lto opt-in. Hardware rendering
-          requires the Pi 5 kernel V3D driver; CI checks loading without a GPU.
-          INSTALL
-          } > "$PACKAGE_DIR/README.txt"
+          cat > "$PACKAGE_DIR/.vkrc" <<'VKRC'
+          mesa_root="$(pwd -P)"
+          export LD_LIBRARY_PATH="$mesa_root/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          export LIBGL_DRIVERS_PATH="$mesa_root/lib/dri"
+          export GBM_BACKENDS_PATH="$mesa_root/lib/gbm"
+          export __GLX_VENDOR_LIBRARY_NAME=mesa
+          egl_json="$(find "$mesa_root/share/glvnd/egl_vendor.d" \
+            -name '50_mesa.json' -print -quit 2>/dev/null)"
+          export __EGL_VENDOR_LIBRARY_FILENAMES="$egl_json"
+          export DRIRC_CONFIGDIR="$mesa_root/share/drirc.d"
+          icd_json="$(find "$mesa_root/share/vulkan/icd.d" \
+            -name 'broadcom_icd*.json' -print -quit 2>/dev/null)"
+          if [[ -n "$icd_json" ]]; then
+            export VK_DRIVER_FILES="$icd_json"
+          fi
+          VKRC
           # Move only the finished package out, then release completed scratch.
           mv "$PACKAGE_DIR" "$BUILD_ROOT/package"
           cd "$BUILD_ROOT"
@@ -461,16 +448,19 @@ jobs:
           mkdir -p "$CHECK_ROOT"
           tar -xzf "$archive" -C "$CHECK_ROOT"
           rm -rf "$BUILD_ROOT/package"
-          export LD_LIBRARY_PATH="$CHECK_ROOT/lib"
-          export GBM_BACKENDS_PATH="$CHECK_ROOT/lib/gbm"
-          export __EGL_VENDOR_LIBRARY_FILENAMES="$CHECK_ROOT/share/glvnd/egl_vendor.d/50_mesa.json"
-          export VK_DRIVER_FILES="$(find "$CHECK_ROOT/share/vulkan/icd.d" -name 'broadcom_icd*.json' -print -quit)"
-          export VK_ICD_FILENAMES="$VK_DRIVER_FILES"
+          cd "$CHECK_ROOT"
+          bash -n .vkrc
+          # shellcheck disable=SC1091
+          source .vkrc
+          test "$mesa_root" = "$(pwd -P)"
+          test -f "$__EGL_VENDOR_LIBRARY_FILENAMES"
+          test -f "$VK_DRIVER_FILES"
           python3 - <<'PY'
           import ctypes as c
           import json, os, re, subprocess, tarfile
           from pathlib import Path
           root = Path(os.environ['CHECK_ROOT']).resolve()
+          assert (root / '.vkrc').is_file()
           archive, = Path(os.environ['BUILD_ROOT']).glob('mesa-*.tar.gz')
           allowed = re.compile(r'(?:libgallium-[\w.+-]+|libEGL_mesa|libGLX_mesa|libgbm|libvulkan_broadcom)\.so(?:\.[\d.]+)?')
           with tarfile.open(archive) as bundle:
@@ -484,7 +474,7 @@ jobs:
               assert path.resolve().is_relative_to(root), rel
               if path.is_dir():
                   continue
-              ok = rel.as_posix() in ('LICENSE', 'README.txt')
+              ok = rel.as_posix() == '.vkrc'
               ok |= rel.parent == Path('lib') and bool(allowed.fullmatch(path.name))
               ok |= rel.as_posix() == 'lib/dri/v3d_dri.so'
               ok |= rel.as_posix() == 'lib/gbm/dri_gbm.so'
@@ -545,6 +535,7 @@ jobs:
               vk.vkDestroyInstance(instance, None)
           print('Archive contents, relocation, ELF and runtime loading checks passed')
           PY
+          cd "$BUILD_ROOT"
           rm -rf -- "$work"
           VALIDATE
           test ! -e "$RAM_ROOT/ram-exhausted"
