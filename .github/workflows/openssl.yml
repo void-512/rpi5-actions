@@ -7,6 +7,10 @@ on:
         description: 'OpenSSL Git tag; leave blank for the latest stable release'
         type: string
         required: false
+      prefix:
+        description: 'Absolute installation prefix; leave blank to use the container system prefix'
+        type: string
+        required: false
 
 permissions:
   contents: read
@@ -26,6 +30,7 @@ jobs:
       CFLAGS: '-O3 -ffast-math -mcpu=cortex-a76+nossbs+noras -flto -fPIC -ffunction-sections -fdata-sections'
       LDFLAGS: '-fuse-ld=lld -Wl,-O3 -Wl,--strip-all -Wl,--gc-sections'
       REQUESTED_OPENSSL_TAG: ${{ inputs.openssl_tag }}
+      REQUESTED_PREFIX: ${{ inputs.prefix }}
       OUTPUT_DIR: ${{ github.workspace }}/dist
 
     steps:
@@ -76,7 +81,7 @@ jobs:
           # All bind mounts are on the shared tmpfs. Copy only final artifacts out.
           docker run --detach --name openssl-build --network host --log-driver none \
             --env DEBIAN_FRONTEND=noninteractive --env LANG=C.UTF-8 --env LC_ALL=C.UTF-8 \
-            --env CFLAGS --env LDFLAGS --env REQUESTED_OPENSSL_TAG \
+            --env CFLAGS --env LDFLAGS --env REQUESTED_OPENSSL_TAG --env REQUESTED_PREFIX \
             --env TMPDIR="$ram_root/work" --env TMP="$ram_root/work" \
             --env TEMP="$ram_root/work" --env BUILD_ROOT="$ram_root/work" \
             --volume "$ram_root/work:$ram_root/work" \
@@ -91,6 +96,11 @@ jobs:
           # shellcheck source=/dev/null
           . /etc/os-release
           test "$VERSION_ID" = 13
+          prefix="${REQUESTED_PREFIX:-}"
+          if [[ -n "$prefix" && "$prefix" != /* ]]; then
+            printf '%s\n' '::error::The installation prefix must be an absolute path.' >&2
+            exit 1
+          fi
           work="$(mktemp -d)"
           export TMPDIR="$work" TMP="$work" TEMP="$work"
           cd "$work"
@@ -161,8 +171,12 @@ jobs:
           rm -rf source/.git
           mkdir build stage "$BUILD_ROOT/artifacts"
           cd build
-          prefix="$(dirname "$(dirname "$(command -v make)")")"
-          openssl_dir="$(openssl version -d | cut -d '"' -f2)"
+          if [[ -n "$prefix" ]]; then
+            openssl_dir="${prefix%/}/ssl"
+          else
+            prefix="$(dirname "$(dirname "$(command -v make)")")"
+            openssl_dir="$(openssl version -d | cut -d '"' -f2)"
+          fi
           perl ../source/Configure linux-aarch64 shared enable-pic no-tests no-docs \
             --prefix="$prefix" --libdir=lib --openssldir="$openssl_dir"
           make -j"$(nproc)"
