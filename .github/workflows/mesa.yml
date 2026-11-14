@@ -1,0 +1,483 @@
+name: Mesa - Debian13
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/mesa.yml
+  pull_request:
+    paths:
+      - .github/workflows/mesa.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mesa-debian13-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      CC: clang-23
+      CXX: clang++-23
+      CFLAGS: '-O3 -ffast-math -mcpu=cortex-a76+nossbs+noras -flto --rtlib=compiler-rt'
+      CXXFLAGS: '-O3 -ffast-math -mcpu=cortex-a76+nossbs+noras -flto -stdlib=libc++ --rtlib=compiler-rt --unwindlib=libunwind'
+      LDFLAGS: '-fuse-ld=lld -Wl,-O3 -Wl,--strip-all -Wl,--gc-sections'
+
+    steps:
+      # A job-level container uses the system Docker daemon. Run debian:13
+      # ourselves so all Docker storage and build scratch stay on private RAM.
+      - name: Start isolated Debian 13 container in RAM
+        run: |
+          set -euo pipefail
+          docker --version
+          dockerd --version
+          task_id="mesa-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          ram_root="$HOME/.cache/codex-tmp/$task_id"
+          docker_root="$HOME/.cache/codex-docker/$task_id"
+          mkdir -p "$ram_root" "$docker_root"
+          printf 'RAM_ROOT=%s\nDOCKER_ROOT=%s\n' "$ram_root" "$docker_root" >> "$GITHUB_ENV"
+          sudo mount -t tmpfs -o size=4G,mode=0700 tmpfs "$ram_root"
+          sudo chown "$(id -u):$(id -g)" "$ram_root"
+          mkdir -p "$ram_root/docker" "$ram_root/work" "$ram_root/tmp"
+          sudo mount --bind "$ram_root/docker" "$docker_root"
+          test "$(findmnt -n -o FSTYPE -T "$ram_root")" = tmpfs
+          test "$(findmnt -n -o FSTYPE -T "$docker_root")" = tmpfs
+          export TMPDIR="$ram_root/tmp" TMP="$ram_root/tmp" TEMP="$ram_root/tmp"
+          printf 'TMPDIR=%s\nTMP=%s\nTEMP=%s\n' "$TMPDIR" "$TMP" "$TEMP" >> "$GITHUB_ENV"
+          mkdir -p "$docker_root/data" "$docker_root/exec"
+          # Docker-managed containerd and BuildKit inherit these private roots.
+          printf '%s\n' '{"features":{"containerd-snapshotter":false},"log-driver":"none"}' \
+            > "$docker_root/daemon.json"
+          # shellcheck disable=SC2024
+          sudo env TMPDIR="$TMPDIR" TMP="$TMP" TEMP="$TEMP" \
+            dockerd --config-file "$docker_root/daemon.json" \
+            --data-root "$docker_root/data" --exec-root "$docker_root/exec" \
+            --pidfile "$docker_root/dockerd.pid" --host "unix://$docker_root/docker.sock" \
+            --group "$(id -gn)" --storage-driver overlay2 \
+            --bridge none --iptables=false --ip6tables=false \
+            --ip-forward=false --ip-masq=false --userland-proxy=false \
+            > "$docker_root/dockerd.log" 2>&1 &
+          export DOCKER_HOST="unix://$docker_root/docker.sock"
+          printf 'DOCKER_HOST=%s\n' "$DOCKER_HOST" >> "$GITHUB_ENV"
+          for ((attempt=0; attempt<60; attempt++)); do
+            if docker info > "$docker_root/docker-info.log" 2>&1; then break; fi
+            sleep 1
+          done
+          if ! actual_root="$(docker info --format '{{.DockerRootDir}}')"; then
+            cat "$docker_root/dockerd.log"
+            exit 1
+          fi
+          test "$actual_root" = "$docker_root/data"
+          # Abort before filling RAM; cleanup runs even when a build is killed.
+          cat > "$ram_root/monitor.sh" <<'MONITOR'
+          set -euo pipefail
+          while sleep 2; do
+            used="$(df --output=pcent "$RAM_ROOT" | tail -n1 | tr -dc '0-9')"
+            if (( used > 80 )); then
+              # Only this task's explicitly completed scratch is reclaimable.
+              rm -rf -- "$RAM_ROOT/work/completed"
+              used="$(df --output=pcent "$RAM_ROOT" | tail -n1 | tr -dc '0-9')"
+              if (( used > 80 )); then
+                touch "$RAM_ROOT/ram-exhausted"
+                docker kill mesa-build mesa-validate || true
+                exit 1
+              fi
+            fi
+          done
+          MONITOR
+          export RAM_ROOT="$ram_root"
+          nohup bash "$ram_root/monitor.sh" > "$ram_root/monitor.log" 2>&1 &
+          printf '%s\n' "$!" > "$ram_root/monitor.pid"
+          docker run --detach --name mesa-build --network host --log-driver none \
+            --env DEBIAN_FRONTEND=noninteractive --env LANG=C.UTF-8 --env LC_ALL=C.UTF-8 \
+            --env CC --env CXX --env CFLAGS --env CXXFLAGS --env LDFLAGS \
+            --env TMPDIR="$ram_root/work" --env TMP="$ram_root/work" \
+            --env TEMP="$ram_root/work" --env BUILD_ROOT="$ram_root/work" \
+            --volume "$ram_root/work:$ram_root/work" \
+            debian:13 sleep infinity
+
+      - name: Build latest stable V3D and V3DV with LLVM 23
+        run: |
+          set -euo pipefail
+          docker exec -i mesa-build bash -seuo pipefail <<'BUILD'
+          test "$(stat -f -c %T "$BUILD_ROOT")" = tmpfs
+          test "$(dpkg --print-architecture)" = arm64
+          work="$(mktemp -d)"
+          export TMPDIR="$work" TMP="$work" TEMP="$work"
+          cd "$work"
+          apt_options=(-o APT::Keep-Downloaded-Packages=false
+            -o Binary::apt::APT::Keep-Downloaded-Packages=false)
+          apt-get "${apt_options[@]}" update
+          apt-get "${apt_options[@]}" install -y --no-install-recommends \
+            ca-certificates curl gnupg xz-utils python3 python3-venv \
+            python3-mako python3-ply python3-yaml python3-packaging \
+            pkg-config bison flex libc6-dev libdrm-dev libexpat1-dev \
+            libelf-dev libzstd-dev zlib1g-dev libglvnd-dev \
+            libx11-dev libx11-xcb-dev libxext-dev libxfixes-dev libxrandr-dev \
+            libxxf86vm-dev libxcb-dri3-dev libxcb-present-dev libxcb-randr0-dev \
+            libxcb-sync-dev libxcb-xfixes0-dev libxshmfence-dev \
+            libwayland-dev wayland-protocols
+          # Resolve APT paths from its configuration, including its trust store.
+          apt_sources='' apt_lists=''
+          eval "$(apt-config shell apt_sources Dir::Etc::sourceparts/d apt_lists Dir::State::lists/d)"
+          apt_keyrings="$(dirname "$apt_sources")/keyrings"
+          mkdir -p "$apt_keyrings"
+          curl --fail --silent --show-error --location --retry 5 \
+            https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | gpg --dearmor -o "$apt_keyrings/llvm.gpg"
+          printf 'deb [arch=arm64 signed-by=%s] https://apt.llvm.org/trixie/ llvm-toolchain-trixie-23 main\n' \
+            "$apt_keyrings/llvm.gpg" > "$apt_sources/llvm23.list"
+          apt-get "${apt_options[@]}" update
+          apt-get "${apt_options[@]}" install -y --no-install-recommends \
+            clang-23 lld-23 llvm-23 libclang-rt-23-dev \
+            libc++-23-dev libc++abi-23-dev libunwind-23-dev
+          apt-get clean
+          rm -rf "${apt_lists:?}/"*
+          llvm_bin="$(dirname "$(readlink -f "$(command -v "$CC")")")"
+          export PATH="$llvm_bin:$PATH"
+          export AR=llvm-ar RANLIB=llvm-ranlib NM=llvm-nm STRIP=llvm-strip
+          "$CC" --version
+          "$CXX" --version
+          ld.lld --version
+          test "$("$CC" -dumpversion | cut -d. -f1)" = 23
+          # A venv avoids Debian's externally-managed Python installation. pip
+          # chooses current stable releases; Mesa checks its own minimum version.
+          python3 -m venv --system-site-packages "$work/toolchain"
+          "$work/toolchain/bin/python" -m pip install --no-cache-dir --upgrade meson ninja
+          export PATH="$work/toolchain/bin:$PATH"
+          meson --version
+          ninja --version
+
+          curl --fail --silent --show-error --location --retry 5 \
+            https://archive.mesa3d.org/ -o index.html
+          version="$(python3 - <<'PY'
+          import re
+          from pathlib import Path
+          versions = set(re.findall(r'href="mesa-(\d+\.\d+\.\d+)\.tar\.xz"', Path('index.html').read_text()))
+          assert versions, 'No stable Mesa releases found'
+          print(max(versions, key=lambda v: tuple(map(int, v.split('.')))))
+          PY
+          )"
+          printf 'Building Mesa %s\n' "$version"
+          curl --fail --silent --show-error --location --retry 5 \
+            "https://archive.mesa3d.org/mesa-$version.tar.xz" -o mesa.tar.xz
+          sha256sum mesa.tar.xz
+          mkdir source
+          tar -xf mesa.tar.xz -C source --strip-components=1
+          test "$(cat source/VERSION)" = "$version"
+          rm mesa.tar.xz index.html
+          export SOURCE_DIR="$work/source" BUILD_DIR="$work/build"
+          export STAGE_DIR="$work/stage" PREFIX="$work/prefix"
+          export PACKAGE_DIR="$work/package"
+          mkdir -p "$PACKAGE_DIR"
+          # Keep the requested flags verbatim. Static libc++ includes libc++abi
+          # in LLVM's Debian packages. With --rtlib=compiler-rt, -static-libgcc
+          # selects static libunwind; it does not switch to the GCC runtime.
+          python3 - <<'PY'
+          import os, shlex
+          from pathlib import Path
+          ldflags = shlex.split(os.environ['LDFLAGS'])
+          common = ldflags + ['-Wl,-rpath,$ORIGIN']
+          cpp = common + ['-static-libstdc++', '-static-libgcc', '-Wl,--exclude-libs,ALL']
+          Path('native.ini').write_text('[built-in options]\n'
+              + 'c_link_args = ' + repr(common) + '\n'
+              + 'cpp_link_args = ' + repr(cpp) + '\n')
+          PY
+          # Check libc++, exception handling, compiler-rt, LTO and LLD together.
+          cat > "$work/probe.cpp" <<'CPP'
+          #include <stdexcept>
+          #include <string>
+          extern "C" int probe() {
+            try { throw std::runtime_error(std::string("mesa")); }
+            catch (const std::exception &e) { return std::string(e.what()) == "mesa" ? 0 : 1; }
+          }
+          CPP
+          # Intentional splitting of the exact compiler/linker flag lists.
+          # shellcheck disable=SC2086
+          "$CXX" $CXXFLAGS $LDFLAGS -shared -fPIC "$work/probe.cpp" \
+            -static-libstdc++ -static-libgcc -Wl,--exclude-libs,ALL -o "$work/probe.so"
+          python3 -c 'import ctypes,sys; assert ctypes.CDLL(sys.argv[1]).probe() == 0' "$work/probe.so"
+          meson setup "$BUILD_DIR" "$SOURCE_DIR" \
+            --native-file "$work/native.ini" --prefix "$PREFIX" \
+            --libdir lib --datadir share --buildtype release --wrap-mode nofallback \
+            -Dgallium-drivers=v3d -Dvulkan-drivers=broadcom \
+            -Dplatforms=x11,wayland -Dglx=dri -Degl=enabled -Dgbm=enabled \
+            -Dglvnd=enabled -Dopengl=true -Dgles1=disabled -Dgles2=enabled \
+            -Dllvm=disabled -Dgallium-rusticl=false -Dgallium-va=disabled \
+            -Dgallium-mediafoundation=disabled -Dvideo-codecs= \
+            -Dvulkan-layers= -Dtools= -Dbuild-tests=false -Dhtml-docs=disabled \
+            -Dvalgrind=disabled -Dlibunwind=disabled -Dlmsensors=disabled \
+            -Dperfetto=false -Dspirv-tools=disabled \
+            -Dteflon=false -Dintel-rt=disabled \
+            -Db_lto=true -Dallow-broken-lto=true -Db_ndebug=true
+          # Audit actual commands, so a toolchain/configuration change cannot
+          # silently drop any requested optimization or runtime selection.
+          python3 - <<'PY'
+          import json, os, shlex
+          from pathlib import Path
+          commands = json.loads((Path(os.environ['BUILD_DIR']) / 'compile_commands.json').read_text())
+          checked = {'c': 0, 'cpp': 0}
+          for item in commands:
+              suffix = Path(item['file']).suffix
+              if suffix not in ('.c', '.cpp', '.cc', '.cxx'):
+                  continue
+              lang = 'c' if suffix == '.c' else 'cpp'
+              args = item.get('arguments') or shlex.split(item['command'])
+              required = shlex.split(os.environ['CFLAGS' if lang == 'c' else 'CXXFLAGS'])
+              assert all(flag in args for flag in required), item['file']
+              assert not any(flag in args for flag in ('-fno-lto', '-fno-fast-math', '-O0', '-O1', '-O2')), item['file']
+              checked[lang] += 1
+          assert all(checked.values()), checked
+          print('Audited compilation flags:', checked)
+          PY
+          meson compile -C "$BUILD_DIR" --jobs "$(nproc)"
+          DESTDIR="$STAGE_DIR" meson install -C "$BUILD_DIR" --no-rebuild
+
+          # Mesa 25+ EGL/GLX/GBM require the matching libgallium. Retain those
+          # Mesa frontends, but use Debian's GLVND dispatch and Vulkan loader.
+          python3 - <<'PY'
+          import json, os, re, shutil
+          from pathlib import Path
+          installed = Path(os.environ['STAGE_DIR'] + os.environ['PREFIX'])
+          package = Path(os.environ['PACKAGE_DIR'])
+          libraries = re.compile(r'(?:libgallium-[\w.+-]+|libEGL_mesa|libGLX_mesa|libgbm|libvulkan_broadcom)\.so(?:\.[\d.]+)?')
+          for src in installed.rglob('*'):
+              if not src.is_file():
+                  continue
+              rel = src.relative_to(installed)
+              keep = (rel.parent == Path('lib') and libraries.fullmatch(src.name))
+              keep |= (rel.parent == Path('lib/dri') and src.name == 'v3d_dri.so')
+              keep |= (rel.parent == Path('share/drirc.d') and src.suffix == '.conf')
+              keep |= (rel.parent == Path('share/vulkan/icd.d') and src.name.startswith('broadcom_icd') and src.suffix == '.json')
+              keep |= (rel.parent == Path('share/glvnd/egl_vendor.d') and src.name == '50_mesa.json')
+              if keep:
+                  dst = package / rel
+                  dst.parent.mkdir(parents=True, exist_ok=True)
+                  if src.is_symlink():
+                      assert not Path(os.readlink(src)).is_absolute(), src
+                      dst.symlink_to(os.readlink(src))
+                  else:
+                      shutil.copy2(src, dst)
+          icds = list(package.glob('share/vulkan/icd.d/broadcom_icd*.json'))
+          assert len(icds) == 1, icds
+          data = json.loads(icds[0].read_text())
+          data['ICD']['library_path'] = os.path.relpath(package / 'lib/libvulkan_broadcom.so', icds[0].parent)
+          icds[0].write_text(json.dumps(data, indent=2) + '\n')
+          vendor = package / 'share/glvnd/egl_vendor.d/50_mesa.json'
+          data = json.loads(vendor.read_text())
+          data['ICD']['library_path'] = 'libEGL_mesa.so.0'
+          vendor.write_text(json.dumps(data, indent=2) + '\n')
+          for pattern in ('lib/dri/v3d_dri.so', 'lib/libgallium-*.so', 'lib/libEGL_mesa.so.0', 'lib/libGLX_mesa.so.0', 'lib/libgbm.so.1', 'lib/libvulkan_broadcom.so'):
+              assert list(package.glob(pattern)), pattern
+          shutil.copy2(Path(os.environ['SOURCE_DIR']) / 'docs/license.rst', package / 'LICENSE')
+          PY
+          # Resolve every external dependency to its owning Debian package.
+          export LD_LIBRARY_PATH="$PACKAGE_DIR/lib"
+          : > "$BUILD_ROOT/runtime-packages.txt"
+          while IFS= read -r -d '' library; do
+            llvm-readelf --file-header "$library" | tee "$work/elf.txt"
+            grep -q 'Class:.*ELF64' "$work/elf.txt"
+            grep -q 'Machine:.*AArch64' "$work/elf.txt"
+            llvm-readelf --dynamic "$library" > "$work/dynamic.txt"
+            if grep -Eq 'TEXTREL|NEEDED.*(libstdc\+\+|libc\+\+|libunwind|libgcc_s|libLLVM)' "$work/dynamic.txt"; then
+              cat "$work/dynamic.txt"
+              exit 1
+            fi
+            ldd -r "$library" | tee "$work/ldd.txt"
+            if grep -Eq 'not found|undefined symbol' "$work/ldd.txt"; then exit 1; fi
+            while IFS= read -r dependency; do
+              if [[ "$dependency" == "$PACKAGE_DIR/"* ]]; then continue; fi
+              canonical="$(readlink -f "$dependency")"
+              owner="$(dpkg-query -S "$canonical" 2> "$work/dpkg-error.txt" || dpkg-query -S "$dependency")"
+              printf '%s\n' "${owner%%: /*}" >> "$BUILD_ROOT/runtime-packages.txt"
+            done < <(awk '$2 == "=>" && $3 ~ /^\// {print $3}' "$work/ldd.txt")
+          done < <(find "$PACKAGE_DIR/lib" -type f -name '*.so*' -print0)
+          sort -u -o "$BUILD_ROOT/runtime-packages.txt" "$BUILD_ROOT/runtime-packages.txt"
+          # Pinning the validation environment to Debian repositories proves no
+          # LLVM repository runtime or copied build dependency is needed.
+          printf '%s\n' "$version" > "$BUILD_ROOT/version"
+          {
+            printf 'Mesa %s / Debian 13 arm64 / Cortex-A76\n\n' "$version"
+            printf 'CC=%s\nCXX=%s\nCFLAGS=%s\nCXXFLAGS=%s\nLDFLAGS=%s\n\n' "$CC" "$CXX" "$CFLAGS" "$CXXFLAGS" "$LDFLAGS"
+            printf 'Debian runtime packages (install with apt):\n'
+            cat "$BUILD_ROOT/runtime-packages.txt"
+            cat <<'INSTALL'
+
+          Extract the archive into an empty directory of your choice, then set:
+            mesa_root="$(pwd -P)"  # Run from the extracted directory.
+            export LD_LIBRARY_PATH="$mesa_root/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            export LIBGL_DRIVERS_PATH="$mesa_root/lib/dri"
+            export __GLX_VENDOR_LIBRARY_NAME=mesa
+            export __EGL_VENDOR_LIBRARY_FILENAMES="$mesa_root/share/glvnd/egl_vendor.d/50_mesa.json"
+            export DRIRC_CONFIGDIR="$mesa_root/share/drirc.d"
+            export VK_DRIVER_FILES="$(find "$mesa_root/share/vulkan/icd.d" -name 'broadcom_icd*.json' -print -quit)"
+            export VK_ICD_FILENAMES="$VK_DRIVER_FILES"
+          Run applications from that shell. No system libraries are overwritten.
+          Use Debian's libegl1/libglx0/libopengl0/libgles2/libvulkan1 dispatchers.
+          LLVM 23 runtimes are statically linked into Mesa where needed.
+          LTO uses Mesa's explicit allow-broken-lto opt-in. Hardware rendering
+          requires the Pi 5 kernel V3D driver; CI checks loading without a GPU.
+          INSTALL
+          } > "$PACKAGE_DIR/README.txt"
+          # Move only the finished package out, then release completed scratch.
+          mv "$PACKAGE_DIR" "$BUILD_ROOT/package"
+          cd "$BUILD_ROOT"
+          rm -rf -- "$work"
+          BUILD
+
+      - name: Validate archive in clean Debian 13 without GPU hardware
+        run: |
+          set -euo pipefail
+          docker rm --force mesa-build
+          test ! -e "$RAM_ROOT/ram-exhausted"
+          docker run --detach --name mesa-validate --network host --log-driver none \
+            --env DEBIAN_FRONTEND=noninteractive --env LANG=C.UTF-8 --env LC_ALL=C.UTF-8 \
+            --env TMPDIR="$RAM_ROOT/work" --env TMP="$RAM_ROOT/work" \
+            --env TEMP="$RAM_ROOT/work" --env BUILD_ROOT="$RAM_ROOT/work" \
+            --volume "$RAM_ROOT/work:$RAM_ROOT/work" \
+            debian:13 sleep infinity
+          docker exec -i mesa-validate bash -seuo pipefail <<'VALIDATE'
+          work="$(mktemp -d)"
+          export TMPDIR="$work" TMP="$work" TEMP="$work"
+          apt-get -o APT::Keep-Downloaded-Packages=false update
+          mapfile -t runtime_packages < "$BUILD_ROOT/runtime-packages.txt"
+          apt-get -o APT::Keep-Downloaded-Packages=false install -y --no-install-recommends \
+            python3 binutils libvulkan1 libegl1 libglx0 "${runtime_packages[@]}"
+          apt-get clean
+          version="$(cat "$BUILD_ROOT/version")"
+          archive="$BUILD_ROOT/mesa-$version-debian13-arm64-cortex-a76.tar.gz"
+          tar -czf "$archive" -C "$BUILD_ROOT/package" .
+          # Validate the actual archive after extracting at a different prefix.
+          export CHECK_ROOT="$work/relocated"
+          mkdir -p "$CHECK_ROOT"
+          tar -xzf "$archive" -C "$CHECK_ROOT"
+          rm -rf "$BUILD_ROOT/package"
+          export LD_LIBRARY_PATH="$CHECK_ROOT/lib"
+          export __EGL_VENDOR_LIBRARY_FILENAMES="$CHECK_ROOT/share/glvnd/egl_vendor.d/50_mesa.json"
+          export VK_DRIVER_FILES="$(find "$CHECK_ROOT/share/vulkan/icd.d" -name 'broadcom_icd*.json' -print -quit)"
+          export VK_ICD_FILENAMES="$VK_DRIVER_FILES"
+          python3 - <<'PY'
+          import ctypes as c
+          import json, os, re, subprocess, tarfile
+          from pathlib import Path
+          root = Path(os.environ['CHECK_ROOT']).resolve()
+          archive, = Path(os.environ['BUILD_ROOT']).glob('mesa-*.tar.gz')
+          allowed = re.compile(r'(?:libgallium-[\w.+-]+|libEGL_mesa|libGLX_mesa|libgbm|libvulkan_broadcom)\.so(?:\.[\d.]+)?')
+          with tarfile.open(archive) as bundle:
+              for member in bundle:
+                  path = Path(member.name)
+                  assert not path.is_absolute() and '..' not in path.parts, member.name
+                  assert member.isdir() or member.isfile() or member.issym(), member.name
+          libraries = []
+          for path in root.rglob('*'):
+              rel = path.relative_to(root)
+              assert path.resolve().is_relative_to(root), rel
+              if path.is_dir():
+                  continue
+              ok = rel.as_posix() in ('LICENSE', 'README.txt')
+              ok |= rel.parent == Path('lib') and bool(allowed.fullmatch(path.name))
+              ok |= rel.as_posix() == 'lib/dri/v3d_dri.so'
+              ok |= rel.parent == Path('share/drirc.d') and path.suffix == '.conf'
+              ok |= rel.parent == Path('share/vulkan/icd.d') and path.name.startswith('broadcom_icd') and path.suffix == '.json'
+              ok |= rel.as_posix() == 'share/glvnd/egl_vendor.d/50_mesa.json'
+              assert ok, f'Unexpected packaged file: {rel}'
+              if path.is_symlink() or '.so' not in path.name:
+                  continue
+              header = subprocess.check_output(['readelf', '-h', path], text=True)
+              assert 'AArch64' in header and 'ELF64' in header, rel
+              dynamic = subprocess.check_output(['readelf', '-d', path], text=True)
+              for line in dynamic.splitlines():
+                  if '(RPATH)' in line or '(RUNPATH)' in line:
+                      assert line.split('[', 1)[1].split(']', 1)[0] == '$ORIGIN', line
+              deps = subprocess.check_output(['ldd', '-r', path], text=True, stderr=subprocess.STDOUT)
+              assert 'not found' not in deps and 'undefined symbol' not in deps, deps
+              print(rel, deps, sep='\n')
+              libraries.append(c.CDLL(str(path), mode=os.RTLD_NOW | os.RTLD_LOCAL))
+          assert libraries
+          icd, = root.glob('share/vulkan/icd.d/broadcom_icd*.json')
+          data = json.loads(icd.read_text())
+          driver = (icd.parent / data['ICD']['library_path']).resolve()
+          assert driver == root / 'lib/libvulkan_broadcom.so'
+          v3dv = c.CDLL(str(driver), mode=os.RTLD_NOW | os.RTLD_LOCAL)
+          v3dv.vk_icdGetInstanceProcAddr
+          v3d = c.CDLL(str(root / 'lib/dri/v3d_dri.so'), mode=os.RTLD_NOW | os.RTLD_LOCAL)
+          v3d.__driDriverGetExtensions_v3d.restype = c.c_void_p
+          assert v3d.__driDriverGetExtensions_v3d()
+          # GLVND must discover the relocated EGL vendor through its manifest.
+          egl = c.CDLL('libEGL.so.1')
+          egl.eglQueryString.argtypes = [c.c_void_p, c.c_uint]
+          egl.eglQueryString.restype = c.c_char_p
+          assert egl.eglQueryString(None, 0x3055)  # EGL_EXTENSIONS; no display/GPU.
+          # Exercise Debian's Vulkan loader with only our packaged ICD enabled.
+          class InstanceInfo(c.Structure):
+              _fields_ = [('sType', c.c_uint32), ('pNext', c.c_void_p), ('flags', c.c_uint32),
+                          ('app', c.c_void_p), ('layerCount', c.c_uint32), ('layers', c.c_void_p),
+                          ('extensionCount', c.c_uint32), ('extensions', c.c_void_p)]
+          vk = c.CDLL('libvulkan.so.1')
+          vk.vkCreateInstance.argtypes = [c.POINTER(InstanceInfo), c.c_void_p, c.POINTER(c.c_void_p)]
+          vk.vkDestroyInstance.argtypes = [c.c_void_p, c.c_void_p]
+          vk.vkEnumeratePhysicalDevices.argtypes = [c.c_void_p, c.POINTER(c.c_uint32), c.c_void_p]
+          instance = c.c_void_p()
+          assert vk.vkCreateInstance(c.byref(InstanceInfo(sType=1)), None, c.byref(instance)) == 0
+          try:
+              count = c.c_uint32()
+              assert vk.vkEnumeratePhysicalDevices(instance, c.byref(count), None) == 0
+              print('V3DV loaded successfully; physical device count:', count.value)
+          finally:
+              vk.vkDestroyInstance(instance, None)
+          print('Archive contents, relocation, ELF and runtime loading checks passed')
+          PY
+          rm -rf -- "$work"
+          VALIDATE
+          test ! -e "$RAM_ROOT/ram-exhausted"
+
+      - name: Collect validated Mesa archive
+        run: |
+          set -euo pipefail
+          output_dir="$(realpath "$GITHUB_WORKSPACE")/dist"
+          mkdir -p "$output_dir"
+          mapfile -t archives < <(find "$RAM_ROOT/work" -maxdepth 1 -name 'mesa-*.tar.gz' -type f)
+          test "${#archives[@]}" = 1
+          cp "${archives[0]}" "$output_dir/"
+          printf 'ARCHIVE_PATH=%s\n' "$output_dir/$(basename "${archives[0]}")" >> "$GITHUB_ENV"
+
+      - name: Upload Mesa tarball
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          path: ${{ env.ARCHIVE_PATH }}
+          archive: false
+          if-no-files-found: error
+
+      - name: Stop isolated Docker and release RAM
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ -z "${RAM_ROOT:-}" ]]; then exit 0; fi
+          if [[ -f "$RAM_ROOT/monitor.pid" ]]; then
+            kill "$(cat "$RAM_ROOT/monitor.pid")" || true
+          fi
+          if [[ -e "$RAM_ROOT/ram-exhausted" ]]; then
+            printf '%s\n' '::error::RAM storage exceeded 80% of 4 GiB; no safe cleanup or disk fallback was available.'
+          fi
+          if mountpoint -q "$DOCKER_ROOT"; then
+            export DOCKER_HOST="unix://$DOCKER_ROOT/docker.sock"
+            docker rm --force mesa-build mesa-validate > "$RAM_ROOT/cleanup.log" 2>&1 || true
+            if sudo test -f "$DOCKER_ROOT/dockerd.pid"; then
+              daemon_pid="$(sudo cat "$DOCKER_ROOT/dockerd.pid")"
+              sudo kill -TERM "$daemon_pid"
+              for ((attempt=0; attempt<30; attempt++)); do
+                if ! sudo kill -0 "$daemon_pid" 2> "$RAM_ROOT/daemon-status.log"; then break; fi
+                sleep 1
+              done
+            fi
+            sudo umount --recursive "$DOCKER_ROOT"
+          fi
+          if mountpoint -q "$RAM_ROOT"; then sudo umount --recursive "$RAM_ROOT"; fi
+          rmdir "$DOCKER_ROOT" "$RAM_ROOT"
