@@ -124,7 +124,7 @@ jobs:
             libxxf86vm-dev libxcb-glx0-dev libxcb-shm0-dev \
             libxcb-dri3-dev libxcb-present-dev libxcb-randr0-dev \
             libxcb-sync-dev libxcb-xfixes0-dev libxshmfence-dev \
-            libwayland-dev wayland-protocols
+            libwayland-dev libwayland-egl-backend-dev
           # Resolve APT paths from its configuration, including its trust store.
           apt_sources='' apt_lists=''
           eval "$(apt-config shell apt_sources Dir::Etc::sourceparts/d apt_lists Dir::State::lists/d)"
