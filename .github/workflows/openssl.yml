@@ -1,8 +1,6 @@
 name: OpenSSL - Debian
 
 on:
-  push:
-    branches: [codex/openssl-debian-validation]
   workflow_dispatch:
     inputs:
       openssl_tag:
@@ -88,6 +86,7 @@ jobs:
           set -euo pipefail
           test "$(stat -f -c %T "$BUILD_ROOT")" = tmpfs
           test "$(dpkg --print-architecture)" = arm64
+          # shellcheck source=/dev/null
           . /etc/os-release
           test "$VERSION_ID" = 13
           work="$(mktemp -d)"
