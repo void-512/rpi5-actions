@@ -1,4 +1,4 @@
-name: Static qBittorrent for Debian 13 ARM64
+name: qBittorrent - Debian 13
 
 on:
   workflow_dispatch:
