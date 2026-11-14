@@ -121,7 +121,8 @@ jobs:
             pkg-config bison flex libc6-dev libdrm-dev libexpat1-dev \
             libelf-dev libzstd-dev zlib1g-dev libglvnd-dev \
             libx11-dev libx11-xcb-dev libxext-dev libxfixes-dev libxrandr-dev \
-            libxxf86vm-dev libxcb-dri3-dev libxcb-present-dev libxcb-randr0-dev \
+            libxxf86vm-dev libxcb-glx0-dev libxcb-shm0-dev \
+            libxcb-dri3-dev libxcb-present-dev libxcb-randr0-dev \
             libxcb-sync-dev libxcb-xfixes0-dev libxshmfence-dev \
             libwayland-dev wayland-protocols
           # Resolve APT paths from its configuration, including its trust store.
@@ -177,6 +178,29 @@ jobs:
           export STAGE_DIR="$work/stage" PREFIX="$work/prefix"
           export PACKAGE_DIR="$work/package"
           mkdir -p "$PACKAGE_DIR"
+          # New Mesa releases need protocol XML newer than Debian stable. Use
+          # Mesa's own checksum-pinned source, with no new runtime libraries.
+          python3 - <<'PY'
+          import configparser, hashlib, os, subprocess, tarfile
+          from pathlib import Path
+          wrap = configparser.ConfigParser()
+          wrap.read(Path(os.environ['SOURCE_DIR']) / 'subprojects/wayland-protocols.wrap')
+          data = wrap['wrap-file']
+          archive = Path(data['source_filename'])
+          subprocess.run(['curl', '--fail', '--silent', '--show-error', '--location', '--retry', '5',
+                          data['source_url'], '-o', str(archive)], check=True)
+          assert hashlib.sha256(archive.read_bytes()).hexdigest() == data['source_hash']
+          with tarfile.open(archive) as bundle:
+              bundle.extractall('protocol-source', filter='data')
+          archive.unlink()
+          Path('protocol-source-dir').write_text(str(Path('protocol-source', data['directory']).resolve()))
+          PY
+          meson setup "$work/protocol-build" "$(cat protocol-source-dir)" \
+            --prefix "$work/protocols" --libdir lib --auto-features disabled -Dtests=false
+          meson install -C "$work/protocol-build"
+          protocol_pc="$(find "$work/protocols" -name wayland-protocols.pc -print -quit)"
+          test -n "$protocol_pc"
+          export PKG_CONFIG_PATH="$(dirname "$protocol_pc")${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
           # Keep the requested flags verbatim. Static libc++ includes libc++abi
           # in LLVM's Debian packages. With --rtlib=compiler-rt, -static-libgcc
           # selects static libunwind; it does not switch to the GCC runtime.
@@ -185,9 +209,11 @@ jobs:
           from pathlib import Path
           ldflags = shlex.split(os.environ['LDFLAGS'])
           common = ldflags + ['-Wl,-rpath,$ORIGIN']
-          cpp = common + ['-static-libstdc++', '-static-libgcc', '-Wl,--exclude-libs,ALL']
+          c = shlex.split(os.environ['CFLAGS']) + common
+          cpp = shlex.split(os.environ['CXXFLAGS']) + common
+          cpp += ['-static-libstdc++', '-static-libgcc', '-Wl,--exclude-libs,ALL']
           Path('native.ini').write_text('[built-in options]\n'
-              + 'c_link_args = ' + repr(common) + '\n'
+              + 'c_link_args = ' + repr(c) + '\n'
               + 'cpp_link_args = ' + repr(cpp) + '\n')
           PY
           # Check libc++, exception handling, compiler-rt, LTO and LLD together.
@@ -220,7 +246,7 @@ jobs:
           # Audit actual commands, so a toolchain/configuration change cannot
           # silently drop any requested optimization or runtime selection.
           python3 - <<'PY'
-          import json, os, shlex
+          import json, os, shlex, subprocess
           from pathlib import Path
           commands = json.loads((Path(os.environ['BUILD_DIR']) / 'compile_commands.json').read_text())
           checked = {'c': 0, 'cpp': 0}
@@ -235,6 +261,11 @@ jobs:
               assert not any(flag in args for flag in ('-fno-lto', '-fno-fast-math', '-O0', '-O1', '-O2')), item['file']
               checked[lang] += 1
           assert all(checked.values()), checked
+          options = json.loads(subprocess.check_output(['meson', 'introspect', '--buildoptions', os.environ['BUILD_DIR']]))
+          options = {item['name']: item['value'] for item in options}
+          for language, flags in (('c', 'CFLAGS'), ('cpp', 'CXXFLAGS')):
+              required = shlex.split(os.environ[flags]) + shlex.split(os.environ['LDFLAGS'])
+              assert all(flag in options[language + '_link_args'] for flag in required), language
           print('Audited compilation flags:', checked)
           PY
           meson compile -C "$BUILD_DIR" --jobs "$(nproc)"
@@ -278,6 +309,10 @@ jobs:
               assert list(package.glob(pattern)), pattern
           shutil.copy2(Path(os.environ['SOURCE_DIR']) / 'docs/license.rst', package / 'LICENSE')
           PY
+          while IFS= read -r license; do
+            cat "$license" >> "$PACKAGE_DIR/LICENSE"
+          done < <(dpkg-query -L libc++-23-dev libc++abi-23-dev libunwind-23-dev \
+            | awk '/\/copyright$/' | sort -u)
           # Resolve every external dependency to its owning Debian package.
           export LD_LIBRARY_PATH="$PACKAGE_DIR/lib"
           : > "$BUILD_ROOT/runtime-packages.txt"
@@ -461,7 +496,9 @@ jobs:
           set -euo pipefail
           if [[ -z "${RAM_ROOT:-}" ]]; then exit 0; fi
           if [[ -f "$RAM_ROOT/monitor.pid" ]]; then
-            kill "$(cat "$RAM_ROOT/monitor.pid")" || true
+            monitor_pid="$(cat "$RAM_ROOT/monitor.pid")"
+            pkill -TERM -P "$monitor_pid" || true
+            kill "$monitor_pid" || true
           fi
           if [[ -e "$RAM_ROOT/ram-exhausted" ]]; then
             printf '%s\n' '::error::RAM storage exceeded 80% of 4 GiB; no safe cleanup or disk fallback was available.'
@@ -479,5 +516,11 @@ jobs:
             fi
             sudo umount --recursive "$DOCKER_ROOT"
           fi
-          if mountpoint -q "$RAM_ROOT"; then sudo umount --recursive "$RAM_ROOT"; fi
+          # Containerd/sleep children can briefly retain open RAM-backed files.
+          for ((attempt=0; attempt<10; attempt++)); do
+            if ! mountpoint -q "$RAM_ROOT"; then break; fi
+            if sudo umount --recursive "$RAM_ROOT"; then break; fi
+            sleep 1
+          done
+          if mountpoint -q "$RAM_ROOT"; then exit 1; fi
           rmdir "$DOCKER_ROOT" "$RAM_ROOT"
