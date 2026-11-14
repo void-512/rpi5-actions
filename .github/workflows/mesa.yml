@@ -214,7 +214,9 @@ jobs:
           common = ldflags + ['-Wl,-rpath,$ORIGIN']
           c = shlex.split(os.environ['CFLAGS']) + common
           cpp = shlex.split(os.environ['CXXFLAGS']) + common
-          cpp += ['-static-libstdc++', '-static-libgcc', '-Wl,--exclude-libs,ALL']
+          # Hide only the embedded LLVM runtimes: Mesa's own static archives
+          # contain public DRI/GLAPI symbols needed by EGL, GLX and GBM.
+          cpp += ['-static-libstdc++', '-static-libgcc', '-Wl,--exclude-libs,libc++.a:libc++abi.a:libunwind.a']
           Path('native.ini').write_text('[built-in options]\n'
               + 'c_link_args = ' + repr(c) + '\n'
               + 'cpp_link_args = ' + repr(cpp) + '\n')
@@ -231,7 +233,8 @@ jobs:
           # Intentional splitting of the exact compiler/linker flag lists.
           # shellcheck disable=SC2086
           "$CXX" $CXXFLAGS $LDFLAGS -shared -fPIC "$work/probe.cpp" \
-            -static-libstdc++ -static-libgcc -Wl,--exclude-libs,ALL -o "$work/probe.so"
+            -static-libstdc++ -static-libgcc \
+            -Wl,--exclude-libs,libc++.a:libc++abi.a:libunwind.a -o "$work/probe.so"
           python3 -c 'import ctypes,sys; assert ctypes.CDLL(sys.argv[1]).probe() == 0' "$work/probe.so"
           meson setup "$BUILD_DIR" "$SOURCE_DIR" \
             --native-file "$work/native.ini" --prefix "$PREFIX" \
