@@ -68,8 +68,11 @@ jobs:
             if docker info > "$docker_root/docker-info.log" 2>&1; then break; fi
             sleep 1
           done
-          if ! docker info; then cat "$docker_root/dockerd.log"; exit 1; fi
-          test "$(docker info --format '{{.DockerRootDir}}')" = "$docker_root/data"
+          if ! actual_root="$(docker info --format '{{.DockerRootDir}}')"; then
+            cat "$docker_root/dockerd.log"
+            exit 1
+          fi
+          test "$actual_root" = "$docker_root/data"
           # All bind mounts are on the shared tmpfs. Copy only final artifacts out.
           docker run --detach --name openssl-build --network host --log-driver none \
             --env DEBIAN_FRONTEND=noninteractive --env LANG=C.UTF-8 --env LC_ALL=C.UTF-8 \
@@ -83,7 +86,6 @@ jobs:
         run: |
           set -euo pipefail
           docker exec -i openssl-build bash -seuo pipefail <<'BUILD'
-          set -euo pipefail
           test "$(stat -f -c %T "$BUILD_ROOT")" = tmpfs
           test "$(dpkg --print-architecture)" = arm64
           # shellcheck source=/dev/null
@@ -93,22 +95,16 @@ jobs:
           export TMPDIR="$work" TMP="$work" TEMP="$work"
           cd "$work"
 
-          # Only completed scratch files may be deleted. Stop if a build cannot
-          # fit in RAM; never fall back to persistent Docker/build storage.
+          # Completed scratch is removed immediately. All remaining files are
+          # active, so stop above 80% RAM storage usage without a disk fallback.
           build_pid=$$
           monitor_ram() {
             while sleep 5; do
               used="$(df --output=pcent "$BUILD_ROOT" | tail -n1 | tr -dc '0-9')"
               if (( used > 80 )); then
-                for stale in "$work"/*.completed; do
-                  if [[ -e "$stale" ]]; then rm -rf -- "$stale"; fi
-                done
-                used="$(df --output=pcent "$BUILD_ROOT" | tail -n1 | tr -dc '0-9')"
-                if (( used > 80 )); then
-                  printf '%s\n' '::error::4 GiB RAM storage exceeds 80% after safe cleanup; no disk fallback.' >&2
-                  kill -TERM "$build_pid"
-                  return
-                fi
+                printf '%s\n' '::error::4 GiB RAM storage exceeds 80%; no completed scratch to reclaim or disk fallback.' >&2
+                kill -TERM "$build_pid"
+                return
               fi
             done
           }
@@ -121,7 +117,7 @@ jobs:
           apt-get "${apt_options[@]}" update
           apt-get "${apt_options[@]}" upgrade -y
           apt-get "${apt_options[@]}" install -y --no-install-recommends \
-            ca-certificates curl gnupg git make perl libc6-dev openssl pkg-config
+            ca-certificates curl gnupg git make perl libc6-dev openssl
           # Discover APT configuration and tool locations rather than assuming
           # installation paths. Always install the newest LLVM 23 packages.
           apt_sources='' apt_lists=''
@@ -162,7 +158,6 @@ jobs:
           git -C source remote add origin https://github.com/openssl/openssl.git
           git -C source fetch --depth 1 origin "refs/tags/$tag"
           git -C source checkout --detach FETCH_HEAD
-          source_commit="$(git -C source rev-parse HEAD)"
           rm -rf source/.git
           mkdir build stage "$BUILD_ROOT/artifacts"
           cd build
@@ -170,7 +165,6 @@ jobs:
           openssl_dir="$(openssl version -d | cut -d '"' -f2)"
           perl ../source/Configure linux-aarch64 shared enable-pic no-tests no-docs \
             --prefix="$prefix" --libdir=lib --openssldir="$openssl_dir"
-          perl configdata.pm --dump > "$BUILD_ROOT/artifacts/configuration.txt"
           make -j"$(nproc)"
           make DESTDIR="$work/stage" install_sw
 
@@ -178,7 +172,7 @@ jobs:
           # OpenSSL's disabled test suite. -z text rejects non-PIC relocations.
           installed="$work/stage$prefix"
           export LD_LIBRARY_PATH="$installed/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          "$installed/bin/openssl" version -a | tee "$BUILD_ROOT/artifacts/version.txt"
+          "$installed/bin/openssl" version -a
           digest="$(printf abc | "$installed/bin/openssl" dgst -sha256 -r)"
           test "${digest%% *}" = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
           printf '%s\n' '#include <openssl/ssl.h>' \
@@ -189,23 +183,15 @@ jobs:
             "$installed/lib/libssl.a" "$installed/lib/libcrypto.a" \
             $LDFLAGS -Wl,-z,text -pthread -ldl -o "$work/pic.so"
           "$READELF" --file-header "$installed/bin/openssl" | grep 'Machine:.*AArch64'
-          "$READELF" --dynamic "$work/pic.so" > "$BUILD_ROOT/artifacts/pic-dynamic.txt"
-          if grep TEXTREL "$BUILD_ROOT/artifacts/pic-dynamic.txt"; then exit 1; fi
+          "$READELF" --dynamic "$work/pic.so" > "$work/pic-dynamic.txt"
+          if grep TEXTREL "$work/pic-dynamic.txt"; then exit 1; fi
 
-          artifact="openssl-${tag}-debian13-arm64-llvm23"
-          cd "$BUILD_ROOT/artifacts"
-          printf 'tag=%s\ncommit=%s\nCFLAGS=%s\nLDFLAGS=%s\n' \
-            "$tag" "$source_commit" "$CFLAGS" "$LDFLAGS" > build-info.txt
-          dpkg-query -W > packages.tsv
-          tar -czf "$artifact.tar.gz" -C "$installed" .
-          sha256sum "$artifact.tar.gz" > SHA256SUMS
-          # Scratch is complete and can now be reclaimed by the RAM monitor.
+          tar -czf "$BUILD_ROOT/artifacts/${tag}-debian13.tar.gz" -C "$installed" .
           cd "$BUILD_ROOT"
-          mv "$work" "$work.completed"
-          rm -rf -- "$work.completed"
+          rm -rf -- "$work"
           BUILD
 
-      - name: Collect release archive and build information
+      - name: Collect release archive
         run: |
           set -euo pipefail
           mkdir -p "$OUTPUT_DIR"
@@ -214,10 +200,9 @@ jobs:
       - name: Upload OpenSSL
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: openssl-debian13-arm64-llvm23
-          path: ${{ env.OUTPUT_DIR }}/
+          path: ${{ env.OUTPUT_DIR }}/*.tar.gz
+          archive: false
           if-no-files-found: error
-          compression-level: 0
 
       - name: Stop isolated Docker and release RAM
         if: always()
