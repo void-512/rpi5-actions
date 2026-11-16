@@ -78,6 +78,7 @@ curl --fail --silent --show-error --location --retry 5 \
       'llvm-project-*/cmake' 'llvm-project-*/llvm' \
       'llvm-project-*/clang' 'llvm-project-*/clang-tools-extra' \
       'llvm-project-*/lld' 'llvm-project-*/compiler-rt' \
+      'llvm-project-*/libc' \
       'llvm-project-*/libcxx' 'llvm-project-*/libcxxabi' \
       'llvm-project-*/libunwind' 'llvm-project-*/runtimes' \
       'llvm-project-*/third-party' 'llvm-project-*/LICENSE.TXT'
@@ -153,7 +154,7 @@ cmake -S source/llvm -B llvm-build "${common[@]}" \
 cmake --build llvm-build --target distribution --parallel 4
 cmake --build llvm-build --target install-distribution-stripped --parallel 1
 mkdir -p "$prefix/share/licenses"
-for project in llvm clang clang-tools-extra lld compiler-rt libcxx libcxxabi libunwind; do
+for project in llvm clang clang-tools-extra lld compiler-rt libc libcxx libcxxabi libunwind; do
   cp "source/$project/LICENSE.TXT" "$prefix/share/licenses/$project.txt"
 done
 rm -rf llvm-build source
