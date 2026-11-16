@@ -125,7 +125,7 @@ common=(-G Ninja -DCMAKE_BUILD_TYPE=Release
 # LLVM. Both phases use the requested flags and the same release sources.
 cmake -S source/runtimes -B runtimes-build "${common[@]}" \
   '-DLLVM_ENABLE_RUNTIMES=compiler-rt;libunwind;libcxxabi;libcxx' \
-  -DCOMPILER_RT_INSTALL_PATH=lib/clang/23 \
+  "-DCOMPILER_RT_INSTALL_PATH=$prefix/lib/clang/23" \
   -DCOMPILER_RT_DEFAULT_TARGET_ONLY=ON \
   -DCOMPILER_RT_BUILD_BUILTINS=ON -DCOMPILER_RT_BUILD_SANITIZERS=ON \
   -DCOMPILER_RT_BUILD_PROFILE=ON -DCOMPILER_RT_BUILD_LIBFUZZER=ON \
@@ -139,6 +139,12 @@ cmake -S source/runtimes -B runtimes-build "${common[@]}" \
   -DLIBCXX_INCLUDE_BENCHMARKS=OFF
 cmake --build runtimes-build --parallel 4
 cmake --install runtimes-build
+for runtime in builtins asan profile; do
+  test -s "$prefix/lib/clang/23/lib/linux/libclang_rt.$runtime-aarch64.a"
+done
+for runtime in libc++ libc++abi libunwind; do
+  test -s "$prefix/lib/$runtime.so.1"
+done
 rm -rf runtimes-build
 printf '%s\n' '::notice::Runtime SDK installed; building LLVM and Clang.'
 df -h "$BUILD_ROOT"
