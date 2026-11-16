@@ -204,6 +204,9 @@ for soname in libz.so.1 libzstd.so.1; do
   test -n "$library"
   cp -L "$library" "$prefix/lib/$soname"
 done
+for package in zlib1g libzstd1; do
+  cp "/usr/share/doc/$package/copyright" "$prefix/share/licenses/$package.txt"
+done
 while IFS= read -r -d '' binary; do
   if patchelf --print-rpath "$binary" > "$work/rpath.txt" 2>/dev/null; then
     relative="$(realpath --relative-to="$(dirname "$binary")" "$prefix/lib")"
