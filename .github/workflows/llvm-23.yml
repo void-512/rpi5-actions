@@ -1,0 +1,128 @@
+name: LLVM 23 - Debian
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['codex/llvm-23-debian']
+    paths:
+      - '.github/workflows/llvm-23.yml'
+      - '.github/scripts/build-llvm-23.sh'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: llvm23-debian-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+    env:
+      CFLAGS: '-O3 -ffast-math -mcpu=cortex-a76+nossbs+noras -flto --rtlib=compiler-rt'
+      CXXFLAGS: '-O3 -ffast-math -mcpu=cortex-a76+nossbs+noras -flto -stdlib=libc++ --rtlib=compiler-rt --unwindlib=libunwind'
+      LDFLAGS: '-fuse-ld=lld -Wl,-O3 -Wl,--strip-all -Wl,--gc-sections'
+      OUTPUT_DIR: ${{ github.workspace }}/dist
+
+    steps:
+      - name: Checkout build recipe
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      # One 4 GiB tmpfs contains the private Docker daemon, image layers,
+      # dependencies, source, build trees, installation and temporary archives.
+      - name: Start isolated Debian 13 container in RAM
+        run: |
+          set -euo pipefail
+          docker --version
+          dockerd --version
+          task_id="llvm23-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          ram_root="$HOME/.cache/codex-tmp/$task_id"
+          docker_root="$HOME/.cache/codex-docker/$task_id"
+          mkdir -p "$ram_root" "$docker_root"
+          printf 'RAM_ROOT=%s\nDOCKER_ROOT=%s\n' "$ram_root" "$docker_root" >> "$GITHUB_ENV"
+          sudo mount -t tmpfs -o size=4G,mode=0700 tmpfs "$ram_root"
+          sudo chown "$(id -u):$(id -g)" "$ram_root"
+          mkdir -p "$ram_root/docker" "$ram_root/work" "$ram_root/tmp"
+          sudo mount --bind "$ram_root/docker" "$docker_root"
+          test "$(findmnt -n -o FSTYPE -T "$ram_root")" = tmpfs
+          test "$(findmnt -n -o FSTYPE -T "$docker_root")" = tmpfs
+          export TMPDIR="$ram_root/tmp" TMP="$ram_root/tmp" TEMP="$ram_root/tmp"
+          printf 'TMPDIR=%s\nTMP=%s\nTEMP=%s\n' "$TMPDIR" "$TMP" "$TEMP" >> "$GITHUB_ENV"
+          mkdir -p "$docker_root/data" "$docker_root/exec"
+          # Docker's managed containerd uses these same private data/exec roots.
+          printf '%s\n' '{"features":{"containerd-snapshotter":false},"log-driver":"none"}' \
+            > "$docker_root/daemon.json"
+          # shellcheck disable=SC2024
+          sudo env TMPDIR="$TMPDIR" TMP="$TMP" TEMP="$TEMP" \
+            dockerd --config-file "$docker_root/daemon.json" \
+            --data-root "$docker_root/data" --exec-root "$docker_root/exec" \
+            --pidfile "$docker_root/dockerd.pid" --host "unix://$docker_root/docker.sock" \
+            --group "$(id -gn)" --storage-driver overlay2 \
+            --bridge none --iptables=false --ip6tables=false \
+            --ip-forward=false --ip-masq=false --userland-proxy=false \
+            > "$docker_root/dockerd.log" 2>&1 &
+          export DOCKER_HOST="unix://$docker_root/docker.sock"
+          printf 'DOCKER_HOST=%s\n' "$DOCKER_HOST" >> "$GITHUB_ENV"
+          for ((attempt=0; attempt<60; attempt++)); do
+            if docker info > "$docker_root/docker-info.log" 2>&1; then break; fi
+            sleep 1
+          done
+          if ! actual_root="$(docker info --format '{{.DockerRootDir}}')"; then
+            cat "$docker_root/dockerd.log"
+            exit 1
+          fi
+          test "$actual_root" = "$docker_root/data"
+          # All bind mounts are on the shared tmpfs. Copy only final artifacts out.
+          docker run --detach --name llvm23-build --network host --log-driver none \
+            --env DEBIAN_FRONTEND=noninteractive --env LANG=C.UTF-8 --env LC_ALL=C.UTF-8 \
+            --env CFLAGS --env CXXFLAGS --env LDFLAGS \
+            --env TMPDIR="$ram_root/work" --env TMP="$ram_root/work" \
+            --env TEMP="$ram_root/work" --env BUILD_ROOT="$ram_root/work" \
+            --volume "$ram_root/work:$ram_root/work" \
+            debian:trixie-slim sleep infinity
+
+      - name: Build and verify native AArch64 LLVM 23 toolchain
+        run: |
+          set -euo pipefail
+          docker exec -i llvm23-build bash -seuo pipefail < .github/scripts/build-llvm-23.sh
+
+      - name: Collect release archive
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUTPUT_DIR"
+          docker cp "llvm23-build:$RAM_ROOT/work/artifacts/." "$OUTPUT_DIR/"
+
+      - name: Upload LLVM toolchain
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          path: ${{ env.OUTPUT_DIR }}/*.tar.xz
+          archive: false
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Stop isolated Docker and release RAM
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ -z "${RAM_ROOT:-}" ]]; then exit 0; fi
+          if mountpoint -q "$DOCKER_ROOT"; then
+            export DOCKER_HOST="unix://$DOCKER_ROOT/docker.sock"
+            docker rm --force llvm23-build > "$RAM_ROOT/cleanup.log" 2>&1 || true
+            if sudo test -f "$DOCKER_ROOT/dockerd.pid"; then
+              daemon_pid="$(sudo cat "$DOCKER_ROOT/dockerd.pid")"
+              sudo kill -TERM "$daemon_pid"
+              for ((attempt=0; attempt<30; attempt++)); do
+                if ! sudo kill -0 "$daemon_pid" 2> "$RAM_ROOT/daemon-status.log"; then break; fi
+                sleep 1
+              done
+            fi
+            sudo umount --recursive "$DOCKER_ROOT"
+          fi
+          if mountpoint -q "$RAM_ROOT"; then sudo umount --recursive "$RAM_ROOT"; fi
+          rmdir "$DOCKER_ROOT" "$RAM_ROOT"
