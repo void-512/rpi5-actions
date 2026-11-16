@@ -50,6 +50,13 @@ export PATH="$bootstrap_bin:$PATH"
 export CC=clang CXX=clang++ AR=llvm-ar RANLIB=llvm-ranlib
 test "$(clang -dumpversion | cut -d. -f1)" = 23
 clang --version
+# libFuzzer's custom relocatable link does not forward CMake's linker flags.
+# Default the ephemeral bootstrap drivers to LLD so they can read LTO archives.
+for driver in clang clang++; do
+  printf '%s\n' '-fuse-ld=lld' > "$bootstrap_bin/$driver.cfg"
+done
+clang -### -x c /dev/null -o "$work/linker-probe" 2> "$work/linker-probe.txt"
+grep -F 'ld.lld"' "$work/linker-probe.txt"
 
 # Resolve the newest stable LLVM 23 tag (never main or a release candidate).
 # The Git refs API returns the complete matching namespace, without pagination.
