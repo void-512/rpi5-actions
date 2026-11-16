@@ -109,6 +109,7 @@ common=(-G Ninja -DCMAKE_BUILD_TYPE=Release
 # LLVM. Both phases use the requested flags and the same release sources.
 cmake -S source/runtimes -B runtimes-build "${common[@]}" \
   '-DLLVM_ENABLE_RUNTIMES=compiler-rt;libunwind;libcxxabi;libcxx' \
+  -DCOMPILER_RT_INSTALL_PATH=lib/clang/23 \
   -DCOMPILER_RT_DEFAULT_TARGET_ONLY=ON \
   -DCOMPILER_RT_BUILD_BUILTINS=ON -DCOMPILER_RT_BUILD_SANITIZERS=ON \
   -DCOMPILER_RT_BUILD_PROFILE=ON -DCOMPILER_RT_BUILD_LIBFUZZER=ON \
