@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+requested_version="${REQUESTED_LLVM_VERSION:-}"
+if [[ -n "$requested_version" && ! "$requested_version" =~ ^23\.[0-9]+\.[0-9]+$ ]]; then
+  printf '%s\n' '::error::LLVM version must have the form 23.x.y, or be blank for the latest stable LLVM 23 release.' >&2
+  exit 1
+fi
+
 test "$(stat -f -c %T "$BUILD_ROOT")" = tmpfs
 test "$(dpkg --print-architecture)" = arm64
 # shellcheck source=/dev/null
@@ -59,19 +65,26 @@ done
 clang -### -x c /dev/null -o "$work/linker-probe" 2> "$work/linker-probe.txt"
 grep -F 'ld.lld"' "$work/linker-probe.txt"
 
-# Resolve the newest stable LLVM 23 tag (never main or a release candidate).
+# Resolve the requested stable LLVM 23 release, or the newest when left blank.
 # The Git refs API returns the complete matching namespace, without pagination.
 curl --fail --silent --show-error --location --retry 5 \
   https://api.github.com/repos/llvm/llvm-project/git/matching-refs/tags/llvmorg-23 \
   -o "$work/refs.json"
-tag="$(python3 - "$work/refs.json" <<'PY'
+tag="$(python3 - "$work/refs.json" "$requested_version" <<'PY'
 import json, re, sys
 refs = json.load(open(sys.argv[1]))
 tags = [r['ref'].removeprefix('refs/tags/') for r in refs]
 stable = [t for t in tags if re.fullmatch(r'llvmorg-23\.\d+\.\d+', t)]
 if not stable:
     sys.exit('No stable LLVM 23 release is published')
-print(max(stable, key=lambda t: tuple(map(int, t.removeprefix('llvmorg-').split('.')))))
+requested = sys.argv[2]
+if requested:
+    tag = f'llvmorg-{requested}'
+    if tag not in stable:
+        sys.exit(f'Requested LLVM 23 release is not published: {requested}')
+else:
+    tag = max(stable, key=lambda t: tuple(map(int, t.removeprefix('llvmorg-').split('.'))))
+print(tag)
 PY
 )"
 printf 'Building %s\n' "$tag"
@@ -90,7 +103,7 @@ curl --fail --silent --show-error --location --retry 5 \
       'llvm-project-*/libcxx' 'llvm-project-*/libcxxabi' \
       'llvm-project-*/libunwind' 'llvm-project-*/runtimes' \
       'llvm-project-*/third-party' 'llvm-project-*/LICENSE.TXT'
-release="llvm-${tag#llvmorg-}-aarch64-linux-debian13-cortex-a76"
+release="llvm-${tag#llvmorg-}-debian13"
 prefix="$work/$release"
 mkdir -p "$prefix"
 

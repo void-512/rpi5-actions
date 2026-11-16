@@ -2,6 +2,11 @@ name: LLVM 23 - Debian
 
 on:
   workflow_dispatch:
+    inputs:
+      llvm_version:
+        description: 'LLVM 23 release version (for example, 23.1.5); leave blank for the latest stable LLVM 23 release'
+        required: false
+        type: string
   push:
     branches: ['codex/llvm-23-debian']
     paths:
@@ -26,6 +31,7 @@ jobs:
       CFLAGS: '-O3 -ffast-math -mcpu=cortex-a76+nossbs+noras -flto --rtlib=compiler-rt'
       CXXFLAGS: '-O3 -ffast-math -mcpu=cortex-a76+nossbs+noras -flto -stdlib=libc++ --rtlib=compiler-rt --unwindlib=libunwind'
       LDFLAGS: '-fuse-ld=lld -Wl,-O3 -Wl,--strip-all -Wl,--gc-sections'
+      REQUESTED_LLVM_VERSION: ${{ inputs.llvm_version }}
       OUTPUT_DIR: ${{ github.workspace }}/dist
 
     steps:
@@ -81,7 +87,7 @@ jobs:
           # All bind mounts are on the shared tmpfs. Copy only final artifacts out.
           docker run --detach --name llvm23-build --network host --log-driver none \
             --env DEBIAN_FRONTEND=noninteractive --env LANG=C.UTF-8 --env LC_ALL=C.UTF-8 \
-            --env CFLAGS --env CXXFLAGS --env LDFLAGS \
+            --env CFLAGS --env CXXFLAGS --env LDFLAGS --env REQUESTED_LLVM_VERSION \
             --env TMPDIR="$ram_root/work" --env TMP="$ram_root/work" \
             --env TEMP="$ram_root/work" --env BUILD_ROOT="$ram_root/work" \
             --volume "$ram_root/work:$ram_root/work" \
