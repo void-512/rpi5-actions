@@ -53,7 +53,10 @@ clang --version
 # libFuzzer's custom relocatable link does not forward CMake's linker flags.
 # Default the ephemeral bootstrap drivers to LLD so they can read LTO archives.
 for driver in clang clang++; do
-  printf '%s\n' '-fuse-ld=lld' > "$bootstrap_bin/$driver.cfg"
+  # LLVM probes flags with -Werror. Link-only flags from the requested CXXFLAGS
+  # must not make valid compile flags (notably -fPIC) appear unsupported.
+  printf '%s\n' '-fuse-ld=lld' '--rtlib=compiler-rt' '--unwindlib=libunwind' \
+    '-Wno-unused-command-line-argument' > "$bootstrap_bin/$driver.cfg"
 done
 clang -### -x c /dev/null -o "$work/linker-probe" 2> "$work/linker-probe.txt"
 grep -F 'ld.lld"' "$work/linker-probe.txt"
@@ -96,6 +99,7 @@ mkdir -p "$prefix"
 # The ELF loader expands the literal $ORIGIN in installed RUNPATH entries.
 # shellcheck disable=SC2016
 common=(-G Ninja -DCMAKE_BUILD_TYPE=Release
+  -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DLLVM_ENABLE_PIC=ON
   "-DCMAKE_INSTALL_PREFIX=$prefix" -DCMAKE_INSTALL_LIBDIR=lib
   "-DCMAKE_C_COMPILER=$bootstrap_bin/clang"
   "-DCMAKE_CXX_COMPILER=$bootstrap_bin/clang++"
@@ -135,6 +139,8 @@ cmake -S source/runtimes -B runtimes-build "${common[@]}" \
 cmake --build runtimes-build --parallel 4
 cmake --install runtimes-build
 rm -rf runtimes-build
+printf '%s\n' '::notice::Runtime SDK installed; building LLVM and Clang.'
+df -h "$BUILD_ROOT"
 
 components=(clang clang-resource-headers libclang libclang-headers clang-cpp
   clang-format clang-tidy clangd lld LLVM
@@ -151,6 +157,7 @@ cmake -S source/llvm -B llvm-build "${common[@]}" \
   -DLLVM_ENABLE_LTO=Full -DLLVM_PARALLEL_LINK_JOBS=1 \
   -DLLVM_BUILD_LLVM_DYLIB=ON -DLLVM_LINK_LLVM_DYLIB=ON \
   -DCLANG_LINK_CLANG_DYLIB=ON -DLLVM_ENABLE_ASSERTIONS=OFF \
+  -DLLVM_ENABLE_LIBCXX=ON \
   -DLLVM_ENABLE_BINDINGS=OFF -DLLVM_ENABLE_LIBXML2=OFF \
   -DLLVM_ENABLE_LIBEDIT=OFF -DLLVM_ENABLE_CURL=OFF \
   -DLLVM_ENABLE_ZLIB=ON -DLLVM_ENABLE_ZSTD=ON \
@@ -165,6 +172,8 @@ for project in llvm clang clang-tools-extra lld compiler-rt libc libcxx libcxxab
   cp "source/$project/LICENSE.TXT" "$prefix/share/licenses/$project.txt"
 done
 rm -rf llvm-build source
+printf '%s\n' '::notice::LLVM toolchain installed; verifying the relocated package.'
+df -h "$BUILD_ROOT"
 
 # Some aliases are optional install components in upstream LLVM.
 for pair in 'llvm-strip llvm-objcopy' 'llvm-ranlib llvm-ar' \
@@ -199,8 +208,11 @@ unset LD_LIBRARY_PATH CPLUS_INCLUDE_PATH C_INCLUDE_PATH LIBRARY_PATH
 mv "$(dirname "$bootstrap_bin")" "$(dirname "$bootstrap_bin").bootstrap-disabled"
 test "$(clang -dumpversion | cut -d. -f1)" = 23
 targets="$(llc --version | sed -n '/Registered Targets:/,$p' | tail -n +2 | sed '/^[[:space:]]*$/d')"
-test "$(printf '%s\n' "$targets" | wc -l)" = 1
 printf '%s\n' "$targets" | grep -E '^[[:space:]]*aarch64[[:space:]]+-'
+if printf '%s\n' "$targets" | awk '{print $1}' | grep -Ev '^(aarch64(_be|_32)?|arm64(_32)?)$'; then
+  printf '%s\n' '::error::Unexpected non-AArch64 code generation backend' >&2
+  exit 1
+fi
 for tool in clang clang++ ld.lld llvm-ar llvm-ranlib llvm-strings llvm-strip \
     llvm-objcopy llvm-objdump llvm-readelf llvm-nm llvm-size llvm-cov \
     llvm-profdata llvm-symbolizer clang-format clang-tidy clangd; do
