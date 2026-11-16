@@ -92,6 +92,9 @@ common=(-G Ninja -DCMAKE_BUILD_TYPE=Release
   "-DCMAKE_C_COMPILER=$bootstrap_bin/clang"
   "-DCMAKE_CXX_COMPILER=$bootstrap_bin/clang++"
   "-DCMAKE_ASM_COMPILER=$bootstrap_bin/clang"
+  -DCMAKE_C_COMPILER_TARGET=aarch64-unknown-linux-gnu
+  -DCMAKE_CXX_COMPILER_TARGET=aarch64-unknown-linux-gnu
+  -DCMAKE_ASM_COMPILER_TARGET=aarch64-unknown-linux-gnu
   "-DCMAKE_AR=$bootstrap_bin/llvm-ar"
   "-DCMAKE_RANLIB=$bootstrap_bin/llvm-ranlib"
   "-DCMAKE_STRIP=$bootstrap_bin/llvm-strip"
@@ -244,7 +247,8 @@ clang -fsanitize=address smoke.c -o smoke-asan
 clang -fprofile-instr-generate smoke.c -o smoke-profile
 LLVM_PROFILE_FILE="$work/smoke.profraw" ./smoke-profile
 llvm-profdata merge "$work/smoke.profraw" -o "$work/smoke.profdata"
-if clang --target=x86_64-linux-gnu -c smoke.c -o rejected.o > rejected.log 2>&1; then
+if printf 'int probe(void) { return 0; }\n' | \
+    clang --target=x86_64-linux-gnu -x c -c - -o rejected.o > rejected.log 2>&1; then
   printf '%s\n' '::error::Unexpected X86 code generation support' >&2
   exit 1
 fi
