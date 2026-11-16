@@ -53,10 +53,8 @@ clang --version
 # libFuzzer's custom relocatable link does not forward CMake's linker flags.
 # Default the ephemeral bootstrap drivers to LLD so they can read LTO archives.
 for driver in clang clang++; do
-  # LLVM probes flags with -Werror. Link-only flags from the requested CXXFLAGS
-  # must not make valid compile flags (notably -fPIC) appear unsupported.
   printf '%s\n' '-fuse-ld=lld' '--rtlib=compiler-rt' '--unwindlib=libunwind' \
-    '-Wno-unused-command-line-argument' > "$bootstrap_bin/$driver.cfg"
+    > "$bootstrap_bin/$driver.cfg"
 done
 clang -### -x c /dev/null -o "$work/linker-probe" 2> "$work/linker-probe.txt"
 grep -F 'ld.lld"' "$work/linker-probe.txt"
@@ -110,7 +108,10 @@ common=(-G Ninja -DCMAKE_BUILD_TYPE=Release
   "-DCMAKE_AR=$bootstrap_bin/llvm-ar"
   "-DCMAKE_RANLIB=$bootstrap_bin/llvm-ranlib"
   "-DCMAKE_STRIP=$bootstrap_bin/llvm-strip"
-  "-DCMAKE_C_FLAGS=$CFLAGS" "-DCMAKE_CXX_FLAGS=$CXXFLAGS"
+  # Preserve all requested flags while allowing LLVM's -Werror compile probes
+  # to ignore the link-only options in that list.
+  "-DCMAKE_C_FLAGS=--start-no-unused-arguments $CFLAGS --end-no-unused-arguments"
+  "-DCMAKE_CXX_FLAGS=--start-no-unused-arguments $CXXFLAGS --end-no-unused-arguments"
   "-DCMAKE_EXE_LINKER_FLAGS=$LDFLAGS"
   "-DCMAKE_SHARED_LINKER_FLAGS=$LDFLAGS"
   "-DCMAKE_MODULE_LINKER_FLAGS=$LDFLAGS"
@@ -142,7 +143,7 @@ rm -rf runtimes-build
 printf '%s\n' '::notice::Runtime SDK installed; building LLVM and Clang.'
 df -h "$BUILD_ROOT"
 
-components=(clang clang-resource-headers libclang libclang-headers clang-cpp
+components=(clang clang-resource-headers libclang libclang-headers clang-cpp clang-scan-deps
   clang-format clang-tidy clangd lld LLVM
   llc opt llvm-ar llvm-as llvm-dis llvm-bcanalyzer llvm-cov llvm-cxxfilt
   llvm-diff llvm-dwarfdump llvm-extract llvm-link llvm-lto llvm-lto2 llvm-mc
@@ -166,7 +167,15 @@ cmake -S source/llvm -B llvm-build "${common[@]}" \
   -DCLANG_DEFAULT_CXX_STDLIB=libc++ -DCLANG_DEFAULT_RTLIB=compiler-rt \
   -DCLANG_DEFAULT_UNWINDLIB=libunwind -DCLANG_DEFAULT_LINKER=lld
 cmake --build llvm-build --target distribution --parallel 4
-cmake --build llvm-build --target install-distribution-stripped --parallel 1
+# The distribution is fully linked. Reclaim completed objects and private
+# archives before copying binaries into the installation. Invoke CMake's
+# component installer directly so Ninja does not rebuild the deleted objects.
+# The runtime SDK's distributable static archives are outside llvm-build.
+find llvm-build -type f \( -name '*.o' -o -name '*.a' \) -delete
+df -h "$BUILD_ROOT"
+for component in "${components[@]}"; do
+  cmake --install llvm-build --strip --component "$component"
+done
 mkdir -p "$prefix/share/licenses"
 for project in llvm clang clang-tools-extra lld compiler-rt libc libcxx libcxxabi libunwind; do
   cp "source/$project/LICENSE.TXT" "$prefix/share/licenses/$project.txt"
@@ -203,6 +212,10 @@ printf 'LLVM: %s\nOS: Debian Trixie arm64\nCPU: Cortex-A76\nTargets: AArch64\nCF
 mkdir relocated
 mv "$prefix" relocated/
 prefix="$work/relocated/$release"
+# Preserve a diagnostic archive even if a subsequent smoke check fails. The
+# workflow labels archives from failed checks as unverified.
+mkdir -p "$BUILD_ROOT/artifacts"
+tar -C "$work/relocated" -cJf "$BUILD_ROOT/artifacts/$release.tar.xz" "$release"
 export PATH="$prefix/bin:/usr/bin:/bin"
 unset LD_LIBRARY_PATH CPLUS_INCLUDE_PATH C_INCLUDE_PATH LIBRARY_PATH
 mv "$(dirname "$bootstrap_bin")" "$(dirname "$bootstrap_bin").bootstrap-disabled"
@@ -215,7 +228,7 @@ if printf '%s\n' "$targets" | awk '{print $1}' | grep -Ev '^(aarch64(_be|_32)?|a
 fi
 for tool in clang clang++ ld.lld llvm-ar llvm-ranlib llvm-strings llvm-strip \
     llvm-objcopy llvm-objdump llvm-readelf llvm-nm llvm-size llvm-cov \
-    llvm-profdata llvm-symbolizer clang-format clang-tidy clangd; do
+    llvm-profdata llvm-symbolizer clang-format clang-tidy clangd clang-scan-deps; do
   "$prefix/bin/$tool" --version
 done
 resource="$(clang -print-resource-dir)"
@@ -247,7 +260,7 @@ int main() {
 CPP
 # Intentional word splitting: these variables are compiler argument lists.
 # shellcheck disable=SC2086
-clang $CFLAGS smoke.c $LDFLAGS -o smoke-c
+clang $CFLAGS smoke.c $LDFLAGS -Wl,-rpath,"$prefix/lib" -o smoke-c
 # shellcheck disable=SC2086
 clang++ $CXXFLAGS smoke.cpp $LDFLAGS -pthread -Wl,-rpath,"$prefix/lib" -o smoke-cxx
 ./smoke-c
@@ -262,9 +275,9 @@ llvm-readelf -h smoke-cxx | grep 'Machine:.*AArch64'
 llvm-strings smoke-c | grep -F 'LLVM 23 C works'
 llvm-strip smoke-c
 ./smoke-c
-clang -fsanitize=address smoke.c -o smoke-asan
+clang -fsanitize=address smoke.c -Wl,-rpath,"$prefix/lib" -o smoke-asan
 ./smoke-asan
-clang -fprofile-instr-generate smoke.c -o smoke-profile
+clang -fprofile-instr-generate smoke.c -Wl,-rpath,"$prefix/lib" -o smoke-profile
 LLVM_PROFILE_FILE="$work/smoke.profraw" ./smoke-profile
 llvm-profdata merge "$work/smoke.profraw" -o "$work/smoke.profdata"
 if printf 'int probe(void) { return 0; }\n' | \
@@ -273,7 +286,5 @@ if printf 'int probe(void) { return 0; }\n' | \
   exit 1
 fi
 
-mkdir -p "$BUILD_ROOT/artifacts"
-tar -C "$work/relocated" -cJf "$BUILD_ROOT/artifacts/$release.tar.xz" "$release"
 cd "$BUILD_ROOT"
 rm -rf -- "$work"

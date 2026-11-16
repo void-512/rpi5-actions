@@ -93,18 +93,34 @@ jobs:
           docker exec -i llvm23-build bash -seuo pipefail < .github/scripts/build-llvm-23.sh
 
       - name: Collect release archive
+        id: collect
+        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
+          if [[ -z "${DOCKER_ROOT:-}" ]] || [[ "${DOCKER_HOST:-}" != "unix://$DOCKER_ROOT/docker.sock" ]]; then exit 0; fi
+          if ! docker exec llvm23-build test -d "$RAM_ROOT/work/artifacts"; then exit 0; fi
           mkdir -p "$OUTPUT_DIR"
           docker cp "llvm23-build:$RAM_ROOT/work/artifacts/." "$OUTPUT_DIR/"
+          echo 'available=true' >> "$GITHUB_OUTPUT"
 
       - name: Upload LLVM toolchain
+        if: ${{ success() && steps.collect.outputs.available == 'true' }}
         uses: actions/upload-artifact@v7.0.2
         with:
           path: ${{ env.OUTPUT_DIR }}/*.tar.xz
           archive: false
           if-no-files-found: error
           retention-days: 30
+
+      - name: Preserve unverified toolchain for diagnosing failed smoke checks
+        if: ${{ failure() && steps.collect.outputs.available == 'true' }}
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: llvm23-unverified-${{ github.run_id }}
+          path: ${{ env.OUTPUT_DIR }}/*.tar.xz
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
 
       - name: Stop isolated Docker and release RAM
         if: always()
