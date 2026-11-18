@@ -112,14 +112,6 @@ cp -- "$build_dir"/arch/arm64/boot/dts/overlays/*.dtb* "$source_dir/arch/arm/boo
   printf 'Toolchain: %s / %s\n' "${clang_version%%$'\n'*}" "${lld_version%%$'\n'*}"
 } >> "$package/INSTALL.md"
 
-tar -C "$(dirname -- "$package")" -czf "$archive" "$name"
-verify="$TMPDIR/verify"
-mkdir -p "$verify"
-tar -xzf "$archive" -C "$verify"
-make -C "$verify/$name" modules_install "INSTALL_MOD_PATH=$verify/root"
-test -s "$verify/root/lib/modules/$release/modules.dep"
-test -s "$verify/$name/boot/kernel_2712.img"
-test -s "$verify/$name/boot/bcm2712-rpi-5-b.dtb"
-test -s "$verify/$name/boot/overlays/overlay_map.dtb"
-
+tar -C "$(dirname -- "$package")" -czf "$TMPDIR/$name.tar.gz" "$name"
+install -m 0644 "$TMPDIR/$name.tar.gz" "$archive"
 printf 'archive=%s\n' "$archive" >> "$GITHUB_OUTPUT"

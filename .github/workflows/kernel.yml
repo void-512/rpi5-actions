@@ -1,15 +1,13 @@
 name: Raspberry Pi 5 Optimized Kernel
 
-run-name: Raspberry Pi 5 Optimized Kernel (${{ inputs.kernel_branch || 'rpi-6.18.y' }})
-
 on:
   workflow_dispatch:
     inputs:
       kernel_branch:
-        description: Branch in raspberrypi/linux (for example, rpi-6.18.y)
-        default: rpi-6.18.y
-        required: true
+        description: 'Branch in raspberrypi/linux, for example rpi-6.18.y'
         type: string
+        required: true
+        default: rpi-6.18.y
 
 permissions:
   contents: read
@@ -22,10 +20,11 @@ jobs:
       run:
         shell: bash
     env:
-      KERNEL_BRANCH: ${{ inputs.kernel_branch || 'rpi-6.18.y' }}
+      KERNEL_BRANCH: ${{ inputs.kernel_branch }}
+      OUTPUT_DIR: ${{ github.workspace }}/dist
 
     steps:
-      - name: Check out the build recipe
+      - name: Check out build recipe
         uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
@@ -50,20 +49,25 @@ jobs:
             bc bison clang-23 flex gzip kmod libelf-dev libssl-dev lld-23 llvm-23 make xz-utils
           echo '/usr/lib/llvm-23/bin' >> "$GITHUB_PATH"
 
-      - name: Build and verify the installable kernel archive
+      - name: Build release archive
         id: build
         run: |
           scratch="$HOME/.cache/codex-tmp/kernel-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           mkdir -p "$scratch"
           sudo mount -t tmpfs -o "size=4G,mode=0700,uid=$(id -u),gid=$(id -g)" tmpfs "$scratch"
-          trap 'sudo umount "$scratch"; rmdir "$scratch"' EXIT
+          trap 'sudo umount "$scratch" && rmdir "$scratch"' EXIT
           test "$(findmnt -n -o FSTYPE -T "$scratch")" = tmpfs
-          export TMPDIR="$scratch" TMP="$scratch" TEMP="$scratch"
-          bash .github/kernel/build.sh "$GITHUB_WORKSPACE/linux" "$RUNNER_TEMP/kernel-build" "$GITHUB_WORKSPACE/dist"
+          mkdir "$scratch/tmp"
+          export TMPDIR="$scratch/tmp" TMP="$scratch/tmp" TEMP="$scratch/tmp"
+          if ! bash .github/kernel/build.sh "$GITHUB_WORKSPACE/linux" "$scratch/build" "$OUTPUT_DIR"; then
+            df -h "$scratch" >&2
+            exit 1
+          fi
 
-      - name: Upload the kernel archive
+      - name: Upload release archive
         uses: actions/upload-artifact@v7.0.2
         with:
           path: ${{ steps.build.outputs.archive }}
           archive: false
           if-no-files-found: error
+          retention-days: 30

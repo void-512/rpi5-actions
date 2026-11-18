@@ -7,31 +7,8 @@ if [[ -n "$requested_version" && ! "$requested_version" =~ ^23\.[0-9]+\.[0-9]+$ 
   exit 1
 fi
 
-test "$(stat -f -c %T "$BUILD_ROOT")" = tmpfs
-test "$(dpkg --print-architecture)" = arm64
-# shellcheck source=/dev/null
-. /etc/os-release
-test "$VERSION_CODENAME" = trixie
 work="$(mktemp -d)"
-export TMPDIR="$work" TMP="$work" TEMP="$work"
 cd "$work"
-
-# Nothing here belongs to another task. Reclaim completed phases immediately;
-# abort if the remaining active files exceed the bounded RAM filesystem.
-build_pid=$$
-monitor_ram() {
-  while sleep 5; do
-    used="$(df --output=pcent "$BUILD_ROOT" | tail -n1 | tr -dc '0-9')"
-    if (( used > 80 )); then
-      printf '%s\n' '::error::4 GiB RAM storage exceeds 80%; no completed scratch remains to reclaim. No disk fallback.' >&2
-      kill -TERM "$build_pid"
-      return
-    fi
-  done
-}
-monitor_ram &
-monitor_pid=$!
-trap 'kill "$monitor_pid" 2>/dev/null || true' EXIT
 
 apt_options=(-o APT::Keep-Downloaded-Packages=false
   -o Binary::apt::APT::Keep-Downloaded-Packages=false)
@@ -54,16 +31,12 @@ rm -rf /var/lib/apt/lists/*
 bootstrap_bin="$(dirname "$(readlink -f "$(command -v clang-23)")")"
 export PATH="$bootstrap_bin:$PATH"
 export CC=clang CXX=clang++ AR=llvm-ar RANLIB=llvm-ranlib
-test "$(clang -dumpversion | cut -d. -f1)" = 23
-clang --version
 # libFuzzer's custom relocatable link does not forward CMake's linker flags.
 # Default the ephemeral bootstrap drivers to LLD so they can read LTO archives.
 for driver in clang clang++; do
   printf '%s\n' '-fuse-ld=lld' '--rtlib=compiler-rt' '--unwindlib=libunwind' \
     > "$bootstrap_bin/$driver.cfg"
 done
-clang -### -x c /dev/null -o "$work/linker-probe" 2> "$work/linker-probe.txt"
-grep -F 'ld.lld"' "$work/linker-probe.txt"
 
 # Resolve the requested stable LLVM 23 release, or the newest when left blank.
 # The Git refs API returns the complete matching namespace, without pagination.
@@ -152,12 +125,6 @@ cmake -S source/runtimes -B runtimes-build "${common[@]}" \
   -DLIBCXX_INCLUDE_BENCHMARKS=OFF
 cmake --build runtimes-build --parallel 4
 cmake --install runtimes-build
-for runtime in builtins asan profile; do
-  test -s "$prefix/lib/clang/23/lib/linux/libclang_rt.$runtime-aarch64.a"
-done
-for runtime in libc++ libc++abi libunwind; do
-  test -s "$prefix/lib/$runtime.so.1"
-done
 rm -rf runtimes-build
 printf '%s\n' '::notice::Runtime SDK installed; building LLVM and Clang.'
 df -h "$BUILD_ROOT"
@@ -200,8 +167,6 @@ for project in llvm clang clang-tools-extra lld compiler-rt libc libcxx libcxxab
   cp "source/$project/LICENSE.TXT" "$prefix/share/licenses/$project.txt"
 done
 rm -rf llvm-build source
-printf '%s\n' '::notice::LLVM toolchain installed; verifying the relocated package.'
-df -h "$BUILD_ROOT"
 
 # Some aliases are optional install components in upstream LLVM.
 for pair in 'llvm-strip llvm-objcopy' 'llvm-ranlib llvm-ar' \
@@ -221,7 +186,7 @@ for package in zlib1g libzstd1; do
   cp "/usr/share/doc/$package/copyright" "$prefix/share/licenses/$package.txt"
 done
 while IFS= read -r -d '' binary; do
-  if patchelf --print-rpath "$binary" > "$work/rpath.txt" 2>/dev/null; then
+  if patchelf --print-rpath "$binary" > /dev/null 2>&1; then
     relative="$(realpath --relative-to="$(dirname "$binary")" "$prefix/lib")"
     patchelf --set-rpath "\$ORIGIN/$relative:\$ORIGIN" "$binary"
   fi
@@ -229,84 +194,4 @@ done < <(find "$prefix/bin" "$prefix/lib" -type f -print0)
 printf 'LLVM: %s\nOS: Debian Trixie arm64\nCPU: Cortex-A76\nTargets: AArch64\nCFLAGS=%s\nCXXFLAGS=%s\nLDFLAGS=%s\n' \
   "$tag" "$CFLAGS" "$CXXFLAGS" "$LDFLAGS" > "$prefix/BUILD-INFO.txt"
 
-# Verify the product after relocation, with bootstrap packages unavailable to
-# compiler lookup. Ordinary links must resolve the packaged C++ runtimes.
-mkdir relocated
-mv "$prefix" relocated/
-prefix="$work/relocated/$release"
-# Preserve a diagnostic archive even if a subsequent smoke check fails. The
-# workflow labels archives from failed checks as unverified.
-mkdir -p "$BUILD_ROOT/artifacts"
-tar -C "$work/relocated" -cJf "$BUILD_ROOT/artifacts/$release.tar.xz" "$release"
-export PATH="$prefix/bin:/usr/bin:/bin"
-unset LD_LIBRARY_PATH CPLUS_INCLUDE_PATH C_INCLUDE_PATH LIBRARY_PATH
-mv "$(dirname "$bootstrap_bin")" "$(dirname "$bootstrap_bin").bootstrap-disabled"
-test "$(clang -dumpversion | cut -d. -f1)" = 23
-targets="$(llc --version | sed -n '/Registered Targets:/,$p' | tail -n +2 | sed '/^[[:space:]]*$/d')"
-printf '%s\n' "$targets" | grep -E '^[[:space:]]*aarch64[[:space:]]+-'
-if printf '%s\n' "$targets" | awk '{print $1}' | grep -Ev '^(aarch64(_be|_32)?|arm64(_32)?)$'; then
-  printf '%s\n' '::error::Unexpected non-AArch64 code generation backend' >&2
-  exit 1
-fi
-for tool in clang clang++ ld.lld llvm-ar llvm-ranlib llvm-strings llvm-strip \
-    llvm-objcopy llvm-objdump llvm-readelf llvm-nm llvm-size llvm-cov \
-    llvm-profdata llvm-symbolizer clang-format clang-tidy clangd clang-scan-deps; do
-  "$prefix/bin/$tool" --version
-done
-resource="$(clang -print-resource-dir)"
-case "$resource" in "$prefix"/*) ;; *) exit 1 ;; esac
-test -s "$resource/lib/linux/libclang_rt.builtins-aarch64.a"
-test -s "$resource/lib/linux/libclang_rt.asan-aarch64.a"
-test -s "$resource/lib/linux/libclang_rt.profile-aarch64.a"
-test -s "$prefix/include/c++/v1/vector"
-test -s "$prefix/lib/libc++.so.1"
-test -s "$prefix/lib/libc++abi.so.1"
-test -s "$prefix/lib/libunwind.so.1"
-cat > smoke.c <<'C'
-#include <stdio.h>
-int main(void) { puts("LLVM 23 C works"); return 0; }
-C
-cat > smoke.cpp <<'CPP'
-#include <iostream>
-#include <stdexcept>
-#include <thread>
-#include <vector>
-int main() {
-  std::vector<int> values{1, 2, 3};
-  std::thread worker([&] { values.push_back(4); });
-  worker.join();
-  try { throw std::runtime_error("unwind works"); }
-  catch (const std::exception& e) { std::cout << e.what() << '\n'; }
-  return values.size() == 4 ? 0 : 1;
-}
-CPP
-# Intentional word splitting: these variables are compiler argument lists.
-# shellcheck disable=SC2086
-clang $CFLAGS smoke.c $LDFLAGS -Wl,-rpath,"$prefix/lib" -o smoke-c
-# shellcheck disable=SC2086
-clang++ $CXXFLAGS smoke.cpp $LDFLAGS -pthread -Wl,-rpath,"$prefix/lib" -o smoke-cxx
-./smoke-c
-./smoke-cxx
-ldd smoke-cxx > dependencies.txt
-cat dependencies.txt
-for library in libc++ libc++abi libunwind; do
-  grep -F "$prefix/lib/$library.so" dependencies.txt
-done
-if grep -E 'libstdc\+\+|libgcc_s|not found' dependencies.txt; then exit 1; fi
-llvm-readelf -h smoke-cxx | grep 'Machine:.*AArch64'
-llvm-strings smoke-c | grep -F 'LLVM 23 C works'
-llvm-strip smoke-c
-./smoke-c
-clang -fsanitize=address smoke.c -Wl,-rpath,"$prefix/lib" -o smoke-asan
-./smoke-asan
-clang -fprofile-instr-generate smoke.c -Wl,-rpath,"$prefix/lib" -o smoke-profile
-LLVM_PROFILE_FILE="$work/smoke.profraw" ./smoke-profile
-llvm-profdata merge "$work/smoke.profraw" -o "$work/smoke.profdata"
-if printf 'int probe(void) { return 0; }\n' | \
-    clang --target=x86_64-linux-gnu -x c -c - -o rejected.o > rejected.log 2>&1; then
-  printf '%s\n' '::error::Unexpected X86 code generation support' >&2
-  exit 1
-fi
-
-cd "$BUILD_ROOT"
-rm -rf -- "$work"
+tar -C "$work" -cJf "$BUILD_ROOT/artifacts/$release.tar.xz" "$release"

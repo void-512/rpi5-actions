@@ -1,0 +1,31 @@
+name: Build in Debian 13
+description: Run a build in isolated RAM-backed Docker and collect its release archive
+
+inputs:
+  script:
+    description: Path to the build script in the checkout
+    required: true
+  env-vars:
+    description: Space-separated names of job environment variables to pass to the build
+    required: true
+
+outputs:
+  archive:
+    description: Path to the release archive in the output directory
+    value: ${{ steps.build.outputs.archive }}
+
+runs:
+  using: composite
+  steps:
+    - name: Build and collect the release archive
+      id: build
+      shell: bash
+      env:
+        BUILD_SCRIPT: ${{ inputs.script }}
+        BUILD_ENV_VARS: ${{ inputs.env-vars }}
+      run: bash "$GITHUB_ACTION_PATH/run.sh" build
+
+    - name: Stop Docker and release RAM
+      if: ${{ always() }}
+      shell: bash
+      run: bash "$GITHUB_ACTION_PATH/run.sh" cleanup
