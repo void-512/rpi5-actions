@@ -94,7 +94,7 @@ PY
 release=$("${kbuild[@]}" -s kernelrelease)
 name="rpi5-kernel-$release"
 package="$TMPDIR/package/$name"
-archive="$dist_dir/$name.tar.zst"
+archive="$dist_dir/$name.tar.gz"
 
 mkdir -p "$package/boot/overlays"
 "${kbuild[@]}" -j6 modules_install "INSTALL_MOD_PATH=$package" INSTALL_MOD_STRIP=1 DEPMOD=true
@@ -112,10 +112,10 @@ cp -- "$build_dir"/arch/arm64/boot/dts/overlays/*.dtb* "$source_dir/arch/arm/boo
   printf 'Toolchain: %s / %s\n' "${clang_version%%$'\n'*}" "${lld_version%%$'\n'*}"
 } >> "$package/INSTALL.md"
 
-tar -C "$(dirname -- "$package")" -I 'zstd -T2 -10' -cf "$archive" "$name"
+tar -C "$(dirname -- "$package")" -czf "$archive" "$name"
 verify="$TMPDIR/verify"
 mkdir -p "$verify"
-tar --zstd -xf "$archive" -C "$verify"
+tar -xzf "$archive" -C "$verify"
 make -C "$verify/$name" modules_install "INSTALL_MOD_PATH=$verify/root"
 test -s "$verify/root/lib/modules/$release/modules.dep"
 test -s "$verify/$name/boot/kernel_2712.img"
