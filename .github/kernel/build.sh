@@ -31,7 +31,7 @@ kbuild=(
   --disable LOCALVERSION_AUTO
 "${kbuild[@]}" olddefconfig
 
-python3 - "$build_dir/.config" "$source_dir/mm/shmem.c" "$recipe_dir/rpi5.config" "$recipe_dir/expected.config" <<'PY'
+python3 - "$build_dir/.config" "$source_dir" "$recipe_dir/rpi5.config" "$recipe_dir/expected.config" <<'PY'
 import re
 import sys
 from pathlib import Path
@@ -49,8 +49,9 @@ def config_values(path):
 
 
 actual = config_values(sys.argv[1])
-shmem_source = Path(sys.argv[2]).read_text()
-# Some branches hard-code these defaults instead of exposing Kconfig choices.
+memory_source = Path(sys.argv[2]) / "mm"
+shmem_source = (memory_source / "shmem.c").read_text()
+# Some branches define these defaults directly in mm/shmem.c.
 for kind in ("shmem", "tmpfs"):
     symbol = f"CONFIG_TRANSPARENT_HUGEPAGE_{kind.upper()}_HUGE_NEVER"
     if symbol not in actual and re.search(
@@ -71,6 +72,22 @@ for symbol in ("CONFIG_CLANG_VERSION", "CONFIG_LLD_VERSION"):
 if errors:
     sys.exit("The selected branch did not resolve the Raspberry Pi 5 profile:\n" + "\n".join(dict.fromkeys(errors)))
 print("Verified the Raspberry Pi 5 Kconfig profile.")
+
+# The defrag sysfs policy has a separate compiled default from THP eligibility.
+huge_memory_path = memory_source / "huge_memory.c"
+huge_memory = huge_memory_path.read_text()
+defaults = re.search(r"(?ms)^unsigned long transparent_hugepage_flags\b[^=]*=(.*?);", huge_memory)
+madvise = "TRANSPARENT_HUGEPAGE_DEFRAG_REQ_MADV_FLAG"
+defer = "TRANSPARENT_HUGEPAGE_DEFRAG_KSWAPD_FLAG"
+if defaults is None:
+    sys.exit("Unable to locate the THP defrag defaults in mm/huge_memory.c.")
+flags = defaults[1]
+if madvise in flags and defer not in flags:
+    updated_flags = flags.replace(madvise, defer)
+    huge_memory_path.write_text(huge_memory[:defaults.start(1)] + updated_flags + huge_memory[defaults.end(1):])
+elif defer not in flags or madvise in flags:
+    sys.exit("Unable to set the THP defrag default to defer in mm/huge_memory.c.")
+print("Verified the kernel's default THP defrag policy is defer.")
 PY
 
 "${kbuild[@]}" -j6 Image modules dtbs

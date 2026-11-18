@@ -17,3 +17,6 @@ and include these tokens on the single line in `cmdline.txt`.
 ```text
 numa=fake=8 numa_policy=interleave iommu_dma_numa_policy=interleave system_heap.max_order=0 thp_anon=64K:always;2M:madvise
 ```
+
+The kernel defaults transparent hugepage defragmentation to `defer`. After
+boot, check the active policy with `cat /sys/kernel/mm/transparent_hugepage/defrag`.
