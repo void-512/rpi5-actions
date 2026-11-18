@@ -1,0 +1,74 @@
+name: Raspberry Pi 5 Optimized Kernel
+
+run-name: Raspberry Pi 5 Optimized Kernel (${{ inputs.kernel_branch || 'rpi-6.18.y' }})
+
+on:
+  push:
+    branches: [codex/rpi5-optimized-kernel]
+    paths:
+      - ".github/kernel/**"
+      - ".github/workflows/kernel.yml"
+  workflow_dispatch:
+    inputs:
+      kernel_branch:
+        description: Branch in raspberrypi/linux (for example, rpi-6.18.y)
+        default: rpi-6.18.y
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    env:
+      KERNEL_BRANCH: ${{ inputs.kernel_branch || 'rpi-6.18.y' }}
+
+    steps:
+      - name: Check out the build recipe
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check out Raspberry Pi Linux
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: raspberrypi/linux
+          ref: refs/heads/${{ env.KERNEL_BRANCH }}
+          path: linux
+          persist-credentials: false
+
+      - name: Install LLVM 23 and build dependencies
+        run: |
+          curl --fail --silent --show-error --location --retry 3 \
+            https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/apt-llvm.gpg
+          echo 'deb [signed-by=/usr/share/keyrings/apt-llvm.gpg] https://apt.llvm.org/noble/ llvm-toolchain-noble-23 main' \
+            | sudo tee /etc/apt/sources.list.d/llvm-23.list
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison clang-23 flex kmod libelf-dev libssl-dev lld-23 llvm-23 make zstd
+          echo '/usr/lib/llvm-23/bin' >> "$GITHUB_PATH"
+
+      - name: Build and verify the installable kernel archive
+        id: build
+        run: |
+          scratch="$HOME/.cache/codex-tmp/kernel-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$scratch"
+          sudo mount -t tmpfs -o "size=4G,mode=0700,uid=$(id -u),gid=$(id -g)" tmpfs "$scratch"
+          trap 'sudo umount "$scratch"; rmdir "$scratch"' EXIT
+          test "$(findmnt -n -o FSTYPE -T "$scratch")" = tmpfs
+          export TMPDIR="$scratch" TMP="$scratch" TEMP="$scratch"
+          bash .github/kernel/build.sh "$GITHUB_WORKSPACE/linux" "$RUNNER_TEMP/kernel-build" "$GITHUB_WORKSPACE/dist"
+
+      - name: Upload the kernel archive
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          path: ${{ steps.build.outputs.archive }}
+          archive: false
+          if-no-files-found: error
