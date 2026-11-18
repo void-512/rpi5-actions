@@ -17,6 +17,7 @@ kbuild=(
   make --no-print-directory -C "$source_dir" "O=$build_dir"
   ARCH=arm64 LLVM=1 LLVM_IAS=1 LOCALVERSION=
   'LD=ld.lld --thinlto-jobs=6'
+  'HOSTLDFLAGS=-fuse-ld=lld'
   'KCFLAGS=-mcpu=cortex-a76+nossbs+noras'
 )
 
@@ -76,7 +77,7 @@ printf '%s\n' "$release" > "$package/kernel.release"
 cp -- "$recipe_dir/Makefile" "$recipe_dir/INSTALL.md" "$build_dir/System.map" "$build_dir/.config" "$package/"
 cp -- "$build_dir/arch/arm64/boot/Image" "$package/boot/kernel_2712.img"
 cp -- "$build_dir"/arch/arm64/boot/dts/broadcom/bcm2712*.dtb "$package/boot/"
-cp -- "$build_dir"/arch/arm64/boot/dts/overlays/*.dtbo "$source_dir/arch/arm/boot/dts/overlays/README" \
+cp -- "$build_dir"/arch/arm64/boot/dts/overlays/*.dtb* "$source_dir/arch/arm/boot/dts/overlays/README" \
   "$package/boot/overlays/"
 {
   printf '\n## Build information\n\n'
@@ -93,5 +94,6 @@ make -C "$verify/$name" modules_install "INSTALL_MOD_PATH=$verify/root"
 test -s "$verify/root/lib/modules/$release/modules.dep"
 test -s "$verify/$name/boot/kernel_2712.img"
 test -s "$verify/$name/boot/bcm2712-rpi-5-b.dtb"
+test -s "$verify/$name/boot/overlays/overlay_map.dtb"
 
 printf 'archive=%s\n' "$archive" >> "$GITHUB_OUTPUT"

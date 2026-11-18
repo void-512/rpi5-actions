@@ -3,11 +3,6 @@ name: Raspberry Pi 5 Optimized Kernel
 run-name: Raspberry Pi 5 Optimized Kernel (${{ inputs.kernel_branch || 'rpi-6.18.y' }})
 
 on:
-  push:
-    branches: [codex/rpi5-optimized-kernel]
-    paths:
-      - ".github/kernel/**"
-      - ".github/workflows/kernel.yml"
   workflow_dispatch:
     inputs:
       kernel_branch:
@@ -52,7 +47,7 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/llvm-23.list
           sudo apt-get -o Acquire::Retries=3 update
           sudo apt-get install -y --no-install-recommends \
-            bc bison clang-23 flex kmod libelf-dev libssl-dev lld-23 llvm-23 make zstd
+            bc bison clang-23 flex kmod libelf-dev libssl-dev lld-23 llvm-23 make xz-utils zstd
           echo '/usr/lib/llvm-23/bin' >> "$GITHUB_PATH"
 
       - name: Build and verify the installable kernel archive
