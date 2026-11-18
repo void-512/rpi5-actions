@@ -31,7 +31,7 @@ kbuild=(
   --disable LOCALVERSION_AUTO
 "${kbuild[@]}" olddefconfig
 
-python3 - "$build_dir/.config" "$recipe_dir/rpi5.config" "$recipe_dir/expected.config" <<'PY'
+python3 - "$build_dir/.config" "$source_dir/mm/shmem.c" "$recipe_dir/rpi5.config" "$recipe_dir/expected.config" <<'PY'
 import re
 import sys
 from pathlib import Path
@@ -49,8 +49,17 @@ def config_values(path):
 
 
 actual = config_values(sys.argv[1])
+shmem_source = Path(sys.argv[2]).read_text()
+# Some branches hard-code these defaults instead of exposing Kconfig choices.
+for kind in ("shmem", "tmpfs"):
+    symbol = f"CONFIG_TRANSPARENT_HUGEPAGE_{kind.upper()}_HUGE_NEVER"
+    if symbol not in actual and re.search(
+        rf"\bstatic int {kind}_huge __read_mostly = SHMEM_HUGE_NEVER;", shmem_source
+    ):
+        actual[symbol] = "y"
+
 errors = []
-for path in sys.argv[2:]:
+for path in sys.argv[3:]:
     for symbol, expected in config_values(path).items():
         value = actual.get(symbol, "n")
         if value != expected:
