@@ -27,6 +27,8 @@ case "$BUILD_LIBRARY" in
     cmake_options=(
       -DZSTD_BUILD_SHARED=ON -DZSTD_BUILD_STATIC=ON
       -DZSTD_BUILD_PROGRAMS=ON -DZSTD_BUILD_TESTS=ON
+      # Use the time budgets from zstd's Linux CMake CI.
+      -DZSTD_FULLBENCH_FLAGS=-i1 -DZSTD_FUZZER_FLAGS=-T30s -DZSTD_ZSTREAM_FLAGS=-T30s
     )
     ;;
   zlib-ng)
