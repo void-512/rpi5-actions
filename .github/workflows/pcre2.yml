@@ -3,6 +3,10 @@ name: PCRE2 JIT - Debian 13
 on:
   workflow_dispatch:
     inputs:
+      pcre2_tag:
+        description: 'PCRE2 Git tag, or blank for the latest upstream commit'
+        type: string
+        required: false
       prefix:
         description: 'Absolute installation prefix, or blank for the Debian system prefix'
         type: string
@@ -24,6 +28,7 @@ jobs:
         shell: bash
     env:
       BUILD_LIBRARY: pcre2
+      REQUESTED_PCRE2_TAG: ${{ inputs.pcre2_tag }}
       REQUESTED_PREFIX: ${{ inputs.prefix }}
       CFLAGS: '-O3 -ffast-math -mcpu=cortex-a76+nossbs+noras -flto --rtlib=compiler-rt'
       CXXFLAGS: '-O3 -ffast-math -mcpu=cortex-a76+nossbs+noras -flto -stdlib=libc++ --rtlib=compiler-rt --unwindlib=libunwind'
@@ -41,7 +46,7 @@ jobs:
         uses: ./.github/actions/debian-build
         with:
           script: .github/scripts/build-library.sh
-          env-vars: BUILD_LIBRARY REQUESTED_PREFIX CFLAGS CXXFLAGS LDFLAGS
+          env-vars: BUILD_LIBRARY REQUESTED_PCRE2_TAG REQUESTED_PREFIX CFLAGS CXXFLAGS LDFLAGS
 
       - name: Upload release archive
         uses: actions/upload-artifact@v7.0.2
