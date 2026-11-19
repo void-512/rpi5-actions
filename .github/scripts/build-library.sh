@@ -8,12 +8,16 @@ if [[ "$prefix" != /* || "$prefix/" == */../* ]]; then
 fi
 
 source_dir=source
-clone_options=(--depth 1)
+tag=''
 case "$BUILD_LIBRARY" in
   pcre2)
     repository=https://github.com/PCRE2Project/pcre2.git
     archive_name=pcre2-jit
-    clone_options+=(--recurse-submodules --shallow-submodules)
+    tag="${REQUESTED_PCRE2_TAG:-}"
+    if [[ -n "$tag" ]] && ! git check-ref-format "refs/tags/$tag"; then
+      printf '%s\n' '::error::Invalid PCRE2 Git tag name.' >&2
+      exit 1
+    fi
     cmake_options=(
       -DBUILD_SHARED_LIBS=ON -DBUILD_STATIC_LIBS=ON
       -DPCRE2_BUILD_PCRE2_8=ON -DPCRE2_BUILD_PCRE2_16=ON -DPCRE2_BUILD_PCRE2_32=ON
@@ -73,7 +77,19 @@ export PATH="$llvm_bin:$PATH"
 export CC=clang CXX=clang++ LD=ld.lld
 "$CC" --version
 
-git clone "${clone_options[@]}" "$repository" source
+if [[ -n "$tag" ]]; then
+  git init source
+  git -C source remote add origin "$repository"
+  # Fetch the tag explicitly even if a branch shares its name.
+  git -C source fetch --depth 1 origin "refs/tags/$tag"
+  git -C source checkout --detach FETCH_HEAD
+  printf 'Selected PCRE2 tag %s\n' "$tag"
+else
+  git clone --depth 1 "$repository" source
+fi
+if [[ "$BUILD_LIBRARY" == pcre2 ]]; then
+  git -C source submodule update --init --recursive --depth 1
+fi
 revision="$(git -C source rev-parse HEAD)"
 printf 'Building %s at %s\n' "$BUILD_LIBRARY" "$revision"
 
