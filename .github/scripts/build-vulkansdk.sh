@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+prefix="${REQUESTED_PREFIX:-}"
+if [[ -n "$prefix" ]]; then
+  if [[ "$prefix" != /* || "$prefix/" == */../* ]]; then
+    printf '%s\n' '::error::The installation prefix must be an absolute path without parent directory components.' >&2
+    exit 1
+  fi
+  IFS= read -r -d '' prefix < <(realpath -zms -- "$prefix")
+fi
+
 work="$(mktemp -d)"
 cd "$work"
 
@@ -113,11 +122,42 @@ else
 fi
 
 release="vulkan-sdk-${sdk_version}-aarch64-linux-debian13-llvm23-cortex-a76"
-out="$work/$release"
-mv aarch64 "$out"
+built_sdk="$PWD/aarch64"
+archive_root="$work"
+archive_path="$release"
+if [[ -n "$prefix" ]]; then
+  archive_root="$work/stage"
+  archive_path="${prefix#/}"
+fi
+out="$archive_root${archive_path:+/$archive_path}"
+mkdir -p -- "${out%/*}"
+mv -T -- "$built_sdk" "$out"
 cd "$work"
 rm -rf vulkan
 mkdir -p "$out"/{bin,include,lib,share}
+
+# Resolve SDK paths from the installed .pc files after the archive is extracted.
+python3 - "$built_sdk" "$out" <<'PY'
+import os
+from pathlib import Path
+import re
+import sys
+
+build_prefix = os.fsencode(sys.argv[1])
+sdk_root = Path(sys.argv[2])
+for pc_file in sdk_root.rglob('pkgconfig/*.pc'):
+    if pc_file.is_symlink() or not pc_file.is_file():
+        continue
+    sdk_prefix = b'${pcfiledir}/' + os.fsencode(os.path.relpath(sdk_root, pc_file.parent))
+    original = pc_file.read_bytes()
+    contents = original.replace(build_prefix, sdk_prefix)
+    if pc_file.name == 'vulkan.pc' and 'VulkanLoader' in pc_file.relative_to(sdk_root).parts:
+        # The loader is installed separately from the headers at the SDK root.
+        contents = re.sub(rb'^includedir[ \t]*=.*$', b'includedir=' + sdk_prefix + b'/include',
+                          contents, flags=re.MULTILINE)
+    if contents != original:
+        pc_file.write_bytes(contents)
+PY
 
 # Keep LLVM runtime DSOs for components that must remain shared.
 # libc (glibc) and Mesa/V3DV intentionally come from the host OS.
@@ -149,4 +189,11 @@ done < <(find "$out/lib" -type f -print0)
 
 printf 'Vulkan SDK: %s\nLLVM: 23\nCPU: Cortex-A76\nOS: Debian 13 aarch64\nmimalloc: %s\n' \
   "$sdk_version" "$mimalloc_tag" > "$out/BUILD-INFO.txt"
-tar -C "$work" -cJf "$BUILD_ROOT/artifacts/$release.tar.xz" "$release"
+cd "$archive_root"
+archive_entries=("$archive_path")
+if [[ -z "$archive_path" ]]; then
+  # Archive the SDK contents without carrying directory metadata for /.
+  shopt -s dotglob
+  archive_entries=(*)
+fi
+tar -cJf "$BUILD_ROOT/artifacts/$release.tar.xz" -- "${archive_entries[@]}"

@@ -7,6 +7,10 @@ on:
         description: 'LunarG SDK version, or blank for the latest Linux release'
         type: string
         required: false
+      prefix:
+        description: 'Absolute installation prefix for extraction from /, or blank for the versioned SDK directory'
+        type: string
+        required: false
       full_sdk:
         description: 'Build all SDK components, including GUI tools'
         type: boolean
@@ -25,6 +29,7 @@ jobs:
         shell: bash
     env:
       REQUESTED_SDK_VERSION: ${{ inputs.sdk_version }}
+      REQUESTED_PREFIX: ${{ inputs.prefix }}
       FULL_SDK: ${{ inputs.full_sdk }}
       CMAKE_BUILD_PARALLEL_LEVEL: '6'
       CFLAGS: '-O3 -mcpu=cortex-a76+nossbs+noras -flto -ffunction-sections -fdata-sections'
@@ -43,7 +48,7 @@ jobs:
         uses: ./.github/actions/debian-build
         with:
           script: .github/scripts/build-vulkansdk.sh
-          env-vars: REQUESTED_SDK_VERSION FULL_SDK CMAKE_BUILD_PARALLEL_LEVEL CFLAGS CXXFLAGS LDFLAGS
+          env-vars: REQUESTED_SDK_VERSION REQUESTED_PREFIX FULL_SDK CMAKE_BUILD_PARALLEL_LEVEL CFLAGS CXXFLAGS LDFLAGS
 
       - name: Upload release archive
         uses: actions/upload-artifact@v7.0.2
