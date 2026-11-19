@@ -1,0 +1,52 @@
+name: PCRE2 JIT - Debian 13
+
+on:
+  workflow_dispatch:
+    inputs:
+      prefix:
+        description: 'Absolute installation prefix, or blank for the Debian system prefix'
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      BUILD_LIBRARY: pcre2
+      REQUESTED_PREFIX: ${{ inputs.prefix }}
+      CFLAGS: '-O3 -ffast-math -mcpu=cortex-a76+nossbs+noras -flto --rtlib=compiler-rt'
+      CXXFLAGS: '-O3 -ffast-math -mcpu=cortex-a76+nossbs+noras -flto -stdlib=libc++ --rtlib=compiler-rt --unwindlib=libunwind'
+      LDFLAGS: '-fuse-ld=lld -Wl,-O3 -Wl,--strip-all -Wl,--gc-sections'
+      OUTPUT_DIR: ${{ github.workspace }}/dist
+
+    steps:
+      - name: Check out build recipe
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build and test release archive
+        id: build
+        uses: ./.github/actions/debian-build
+        with:
+          script: .github/scripts/build-library.sh
+          env-vars: BUILD_LIBRARY REQUESTED_PREFIX CFLAGS CXXFLAGS LDFLAGS
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          path: ${{ steps.build.outputs.archive }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 30
