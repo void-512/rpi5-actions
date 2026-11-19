@@ -14,10 +14,6 @@ case "$BUILD_LIBRARY" in
     repository=https://github.com/PCRE2Project/pcre2.git
     archive_name=pcre2-jit
     tag="${REQUESTED_PCRE2_TAG:-}"
-    if [[ -n "$tag" ]] && ! git check-ref-format "refs/tags/$tag"; then
-      printf '%s\n' '::error::Invalid PCRE2 Git tag name.' >&2
-      exit 1
-    fi
     cmake_options=(
       -DBUILD_SHARED_LIBS=ON -DBUILD_STATIC_LIBS=ON
       -DPCRE2_BUILD_PCRE2_8=ON -DPCRE2_BUILD_PCRE2_16=ON -DPCRE2_BUILD_PCRE2_32=ON
@@ -56,6 +52,11 @@ apt_options=(-o APT::Keep-Downloaded-Packages=false
 apt-get "${apt_options[@]}" update
 apt-get "${apt_options[@]}" install -y --no-install-recommends \
   ca-certificates cmake curl git gnupg libc6-dev ninja-build
+
+if [[ -n "$tag" ]] && ! git check-ref-format "refs/tags/$tag"; then
+  printf '%s\n' '::error::Invalid PCRE2 Git tag name.' >&2
+  exit 1
+fi
 
 apt_sources='' apt_lists=''
 eval "$(apt-config shell apt_sources Dir::Etc::sourceparts/d apt_lists Dir::State::lists/d)"
